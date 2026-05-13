@@ -155,5 +155,6 @@ func (s *StatusServer) baseTemplateData(start time.Time) StatusData {
 		NodePeerCleanupEnabled:          s.Config().PeerCleanupEnabled,
 		NodePeerCleanupMaxPingMs:        s.Config().PeerCleanupMaxPingMs,
 		NodePeerCleanupMinPeers:         s.Config().PeerCleanupMinPeers,
+		NodeNetwork:                     s.ensureNodeInfo().network,
 	}
 }

@@ -168,6 +168,7 @@ func (mc *MinerConn) processShare(task submissionTask, ctx shareContext) {
 
 	if ctx.isBlock {
 		mc.noteValidSubmit(now)
+		mc.recordShare(workerName, true, creditedDiff, ctx.shareDiff, "", shareHash, detail, now)
 		mc.handleBlockShare(reqID, job, task.jobID, workerName, (&task).extranonce2Decoded(), uint32ToHex8Lower(task.ntimeVal), uint32ToHex8Lower(task.nonceVal), task.useVersion, task.scriptTime, ctx.hashHex, ctx.shareDiff, now)
 		mc.trackBestShare(workerName, shareHash, ctx.shareDiff, now)
 		mc.maybeUpdateSavedWorkerMinuteBestDiff(ctx.shareDiff, now)
@@ -187,7 +188,7 @@ func (mc *MinerConn) processShare(task submissionTask, ctx shareContext) {
 	mc.maybeUpdateSavedWorkerBestDiff(ctx.shareDiff)
 
 	if mc.maybeAdjustDifficulty(now) {
-		mc.sendNotifyFor(job, true)
+		mc.sendNotifyForWithReason(job, true, "template_update")
 	}
 
 	if (debugLogging || verboseRuntimeLogging) && logger.Enabled(logLevelInfo) {

@@ -93,6 +93,89 @@ func TestMinerConn_MiningAuthAlias(t *testing.T) {
 	}
 }
 
+func TestMinerConn_SubscribeAuthorizeSendsInitialNotifyWithinOneSecond(t *testing.T) {
+	server, client := net.Pipe()
+	defer client.Close()
+
+	jm := NewJobManager(nil, Config{}, nil, nil, nil)
+	job := benchmarkSubmitJobForTest(t)
+	jm.mu.Lock()
+	jm.curJob = job
+	jm.mu.Unlock()
+
+	mc := NewMinerConn(
+		context.Background(),
+		server,
+		jm,
+		nil,
+		Config{ConnectionTimeout: time.Hour, Extranonce2Size: 4, MinDifficulty: 1, DefaultDifficulty: 1},
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		false,
+	)
+
+	done := make(chan struct{})
+	go func() {
+		mc.handle()
+		close(done)
+	}()
+
+	br := bufio.NewReader(client)
+	worker := "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa.worker"
+
+	if _, err := io.WriteString(client, `{"id":1,"method":"mining.subscribe","params":["SparkMiner/1.0"]}`+"\n"); err != nil {
+		t.Fatalf("write subscribe: %v", err)
+	}
+	if _, err := br.ReadString('\n'); err != nil {
+		t.Fatalf("read subscribe response: %v", err)
+	}
+
+	authorizedAt := time.Now()
+	if _, err := io.WriteString(client, `{"id":2,"method":"mining.authorize","params":[`+strconvQuote(worker)+`,"x"]}`+"\n"); err != nil {
+		t.Fatalf("write authorize: %v", err)
+	}
+
+	deadline := authorizedAt.Add(1 * time.Second)
+	seenDifficulty := false
+	seenNotify := false
+	for !seenNotify {
+		if err := client.SetReadDeadline(deadline); err != nil {
+			t.Fatalf("set read deadline: %v", err)
+		}
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("expected mining.notify within 1s of authorize: %v", err)
+		}
+		if strings.Contains(line, `"method":"mining.set_difficulty"`) {
+			seenDifficulty = true
+		}
+		if strings.Contains(line, `"method":"mining.notify"`) {
+			seenNotify = true
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+	}
+
+	if !seenDifficulty {
+		t.Fatalf("expected mining.set_difficulty after authorize")
+	}
+	if !seenNotify {
+		t.Fatalf("expected mining.notify within 1s of authorize")
+	}
+
+	_ = client.Close()
+	_ = server.Close()
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatalf("miner conn did not exit")
+	}
+}
+
 func strconvQuote(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)

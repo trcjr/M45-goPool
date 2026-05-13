@@ -1454,7 +1454,9 @@ func (mc *MinerConn) sendDifficultyNotification(diff float64) {
 	}
 	if err := mc.writeJSON(msg); err != nil {
 		logger.Error("difficulty write error", "remote", mc.id, "error", err)
+		return
 	}
+	logger.Info("difficulty sent", "component", "miner", "kind", "lifecycle", "remote", mc.id, "difficulty", diff)
 }
 
 type stratumDifficulty float64

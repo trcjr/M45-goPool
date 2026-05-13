@@ -41,6 +41,7 @@ type GBTTransaction struct {
 
 type Job struct {
 	JobID                   string
+	NotifyReason            string
 	Template                GetBlockTemplateResult
 	Target                  *big.Int
 	targetBE                [32]byte

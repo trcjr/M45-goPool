@@ -134,6 +134,7 @@ func (mc *MinerConn) handleSubscribeID(id any, clientID string, haveClientID boo
 	}
 
 	mc.subscribed = true
+	logger.Info("miner subscribed", "component", "miner", "kind", "lifecycle", "remote", mc.id, "session", mc.currentSessionID())
 
 	// Result spec (simplified):
 	// [
@@ -170,6 +171,7 @@ func (mc *MinerConn) handleSubscribeID(id any, clientID string, haveClientID boo
 		}
 		if mc.jobMgr != nil {
 			mc.scheduleInitialWork()
+			mc.maybeSendInitialWork()
 		}
 	}
 
@@ -375,6 +377,7 @@ func (mc *MinerConn) handleAuthorizeID(id any, workerParam string, pass string) 
 	mc.authorized = true
 
 	mc.writeTrueResponse(id)
+	logger.Info("miner authorized", "component", "miner", "kind", "lifecycle", "remote", mc.id, "worker", workerName)
 
 	// If the miner hasn't subscribed yet, accept authorization but don't start
 	// the job listener or send any pool->miner notifications until subscribe.
@@ -411,6 +414,7 @@ func (mc *MinerConn) handleAuthorizeID(id any, workerParam string, pass string) 
 	// to be valid, schedule initial difficulty and a job so hashing can start.
 	// We delay very briefly to give miners a chance to send suggest_* first.
 	mc.scheduleInitialWork()
+	mc.maybeSendInitialWork()
 	if profiler := getMinerProfileCollector(); profiler != nil {
 		profiler.ObserveAuthorize(mc, workerName)
 	}
@@ -925,7 +929,7 @@ func (mc *MinerConn) maybeSendCleanJobAfterSuggest() {
 	}
 	if mc.jobMgr != nil {
 		if job := mc.jobMgr.CurrentJob(); job != nil {
-			mc.sendNotifyFor(job, true)
+			mc.sendNotifyForWithReason(job, true, "template_update")
 		}
 	}
 }
@@ -1151,9 +1155,28 @@ func (mc *MinerConn) handleConfigure(req *StratumRequest) {
 	mc.maybeSendInitialWork()
 }
 
-func (mc *MinerConn) sendNotifyFor(job *Job, forceClean bool) {
+func notifyReasonOrDefault(reason string, clean bool) string {
+	reason = strings.TrimSpace(reason)
+	if reason != "" {
+		return reason
+	}
+	if clean {
+		return "tip_update"
+	}
+	return "template_update"
+}
+
+func (mc *MinerConn) sendNotifyFor(job *Job, forceClean bool) bool {
+	return mc.sendNotifyForWithReason(job, forceClean, "")
+}
+
+func (mc *MinerConn) sendNotifyForWithReason(job *Job, forceClean bool, reason string) bool {
 	if !mc.subscribed {
-		return
+		return false
+	}
+	reason = notifyReasonOrDefault(reason, job != nil && job.Clean)
+	if reason == "accepted_block" {
+		forceClean = true
 	}
 	// Opportunistically adjust difficulty before notifying about the job.
 	// If difficulty changed, force clean so the miner uses the new difficulty.
@@ -1185,12 +1208,12 @@ func (mc *MinerConn) sendNotifyFor(job *Job, forceClean bool) {
 	if worker == "" {
 		logger.Debug("notify aborted: missing authorized worker", "component", "miner", "kind", "notify", "remote", mc.id)
 		mc.Close("missing authorized worker")
-		return
+		return false
 	}
 	if _, _, ok := mc.ensureWorkerWallet(worker); !ok {
 		logger.Warn("notify aborted: unable to resolve worker wallet", "component", "miner", "kind", "notify", "remote", mc.id, "worker", worker)
 		mc.Close("wallet resolution failed")
-		return
+		return false
 	}
 	var (
 		coinb1 string
@@ -1258,7 +1281,7 @@ func (mc *MinerConn) sendNotifyFor(job *Job, forceClean bool) {
 	}
 	if err != nil {
 		logger.Error("notify coinbase parts", "component", "miner", "kind", "coinbase", "error", err)
-		return
+		return false
 	}
 	mc.jobMu.Lock()
 	if mc.jobNotifyCoinbase == nil {
@@ -1296,6 +1319,18 @@ func (mc *MinerConn) sendNotifyFor(job *Job, forceClean bool) {
 		cleanJobs,
 	}
 
+	logFields := []any{
+		"component", "miner",
+		"kind", "notify",
+		"remote", mc.id,
+		"session", mc.currentSessionID(),
+		"worker", worker,
+		"job_id", stratumJobID,
+		"height", job.Template.Height,
+		"clean_jobs", cleanJobs,
+		"reason", reason,
+	}
+
 	if debugLogging || verboseRuntimeLogging {
 		merkleRoot := computeMerkleRootBE(coinb1, coinb2, job.MerkleBranches)
 		headerHashLE := headerHashFromNotify(prevhashLE, merkleRoot, uint32(job.Template.Version), job.Template.Bits, job.Template.CurTime)
@@ -1321,10 +1356,12 @@ func (mc *MinerConn) sendNotifyFor(job *Job, forceClean bool) {
 		Method: "mining.notify",
 		Params: params,
 	}); err != nil {
-		logger.Error("notify write error", "component", "miner", "kind", "notify", "remote", mc.id, "error", err)
-		return
+		logger.Warn("notify send failed", append(logFields, "error", err)...)
+		return false
 	}
 	mc.recordNotifySent(time.Now())
+	logger.Info("notify sent", logFields...)
+	return true
 }
 
 // computeMerkleRootBE rebuilds the merkle root (big-endian) from coinb1/coinb2 and branches.
