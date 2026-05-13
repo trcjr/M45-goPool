@@ -547,9 +547,20 @@ func (mc *MinerConn) maybeSendInitialWorkDue(now time.Time) {
 
 func (mc *MinerConn) sendInitialWork() {
 	if !mc.subscribed || !mc.authorized || !mc.listenerOn {
+		reason := "handshake incomplete"
+		switch {
+		case !mc.subscribed:
+			reason = "not subscribed"
+		case !mc.authorized:
+			reason = "not authorized"
+		case !mc.listenerOn:
+			reason = "job listener not started"
+		}
+		logger.Info("initial notify not sent", "component", "miner", "kind", "lifecycle", "remote", mc.id, "reason", reason)
 		return
 	}
 	if mc.jobMgr == nil {
+		logger.Info("initial notify not sent", "component", "miner", "kind", "lifecycle", "remote", mc.id, "reason", "no job manager")
 		return
 	}
 
@@ -580,9 +591,34 @@ func (mc *MinerConn) sendInitialWork() {
 	mc.sendPendingStratumSetup()
 
 	// First job always has clean_jobs=true so the miner starts fresh.
-	if job := mc.jobMgr.CurrentJob(); job != nil {
-		mc.sendNotifyFor(job, true)
+	job := mc.jobMgr.CurrentJob()
+	if job == nil {
+		if mc.jobMgr.rpc == nil {
+			logger.Info("initial notify not sent", "component", "miner", "kind", "lifecycle", "remote", mc.id, "reason", "no cached job and rpc unavailable")
+			return
+		}
+		refreshCtx := mc.ctx
+		if refreshCtx == nil {
+			refreshCtx = context.Background()
+		}
+		fetchCtx, cancel := context.WithTimeout(refreshCtx, 5*time.Second)
+		err := mc.jobMgr.refreshJobCtxForce(fetchCtx)
+		cancel()
+		if err != nil {
+			logger.Warn("initial notify not sent", "component", "miner", "kind", "lifecycle", "remote", mc.id, "reason", "job refresh failed", "error", err)
+			return
+		}
+		job = mc.jobMgr.CurrentJob()
 	}
+	if job == nil {
+		logger.Info("initial notify not sent", "component", "miner", "kind", "lifecycle", "remote", mc.id, "reason", "no current job after refresh")
+		return
+	}
+	if !mc.sendNotifyFor(job, true) {
+		logger.Warn("initial notify not sent", "component", "miner", "kind", "lifecycle", "remote", mc.id, "reason", "notify write failed", "job_id", job.JobID)
+		return
+	}
+	logger.Info("initial notify sent", "component", "miner", "kind", "lifecycle", "remote", mc.id, "job_id", job.JobID)
 }
 
 // currentReadTimeout returns a dynamic read timeout based on whether the
