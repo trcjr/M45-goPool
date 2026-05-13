@@ -1154,7 +1154,6 @@ func (mc *MinerConn) handleConfigure(req *StratumRequest) {
 	// for miners that don't send configure/suggest_* during handshake.
 	mc.maybeSendInitialWork()
 }
-
 func notifyReasonOrDefault(reason string, clean bool) string {
 	reason = strings.TrimSpace(reason)
 	if reason != "" {
