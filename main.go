@@ -537,6 +537,8 @@ func main() {
 		// Other endpoints
 		mux.HandleFunc("/api/blocks", statusServer.handleBlocksListJSON)
 	}
+	// SparkMiner unified stats endpoint (always enabled, lightweight, no auth required)
+	mux.HandleFunc("/stats", statusServer.handleSparkMinerStats)
 	// HTML endpoints
 	mux.HandleFunc("/admin", statusServer.handleAdminPage)
 	mux.HandleFunc("/admin/miners", statusServer.handleAdminMinersPage)
