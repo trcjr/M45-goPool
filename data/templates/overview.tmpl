@@ -825,6 +825,8 @@
 	<script>
 	(function() {
 		const REFRESH_INTERVAL = 5000;
+		const NODE_NETWORK = String('{{.NodeNetwork}}' || '').trim().toLowerCase();
+		const IS_REGTEST = NODE_NETWORK === 'regtest';
 		const valueEl = document.getElementById('status-pool-hashrate');
 		const blockHeightEl = document.getElementById('status-block-height');
 		const blockHeightContextEl = document.getElementById('status-block-height-context');
@@ -931,6 +933,35 @@
 				return `${minutes}m ${secs}s`;
 			}
 			return `${secs}s`;
+		}
+
+		function derivedExpectedBlockIntervalSec(recentBlockTimes) {
+			if (!Array.isArray(recentBlockTimes) || recentBlockTimes.length < 2) {
+				return 10 * 60;
+			}
+			const stamps = recentBlockTimes
+				.map(ts => new Date(ts).getTime())
+				.filter(ms => Number.isFinite(ms) && ms > 0)
+				.sort((a, b) => a - b);
+			if (stamps.length < 2) {
+				return 10 * 60;
+			}
+			const deltas = [];
+			for (let i = 1; i < stamps.length; i++) {
+				const deltaSec = Math.floor((stamps[i] - stamps[i - 1]) / 1000);
+				if (deltaSec > 0 && deltaSec <= 3600) {
+					deltas.push(deltaSec);
+				}
+			}
+			if (deltas.length === 0) {
+				return 10 * 60;
+			}
+			deltas.sort((a, b) => a - b);
+			const mid = Math.floor(deltas.length / 2);
+			if (deltas.length % 2 === 0) {
+				return Math.max(1, Math.round((deltas[mid - 1] + deltas[mid]) / 2));
+			}
+			return Math.max(1, deltas[mid]);
 		}
 
 		function formatBTCShort(sats) {
@@ -1125,7 +1156,10 @@
 						const height = data.block_height;
 						blockHeightEl.textContent = height.toLocaleString();
 						if (blockHeightContextEl) {
-							const retarget = data.next_difficulty_retarget;
+							if (IS_REGTEST) {
+								blockHeightContextEl.innerHTML = `N/A<br><span class="text-sm" style="color:var(--text-muted);">(regtest)</span>`;
+							} else {
+								const retarget = data.next_difficulty_retarget;
 								if (retarget && typeof retarget.height === 'number' && retarget.height > 0) {
 									const parts = [];
 									if (typeof retarget.blocks_away === 'number') {
@@ -1139,13 +1173,14 @@
 									}
 									const summary = parts.filter(Boolean).join(' · ');
 									blockHeightContextEl.innerHTML = `${retarget.height.toLocaleString()}<br><span class="text-sm" style="color:var(--text-muted);">(${summary})</span>`;
-							} else {
-								const interval = 2016;
-								const next = (Math.floor(height / interval) + 1) * interval;
-								const remaining = Math.max(0, next - height);
-								const durationSeconds = remaining * 10 * 60;
-								const durationText = formatDuration(durationSeconds);
-								blockHeightContextEl.innerHTML = `${next.toLocaleString()}<br><span class="text-sm" style="color:var(--text-muted);">(~${durationText})</span>`;
+								} else {
+									const interval = 2016;
+									const next = (Math.floor(height / interval) + 1) * interval;
+									const remaining = Math.max(0, next - height);
+									const durationSeconds = remaining * 10 * 60;
+									const durationText = formatDuration(durationSeconds);
+									blockHeightContextEl.innerHTML = `${next.toLocaleString()}<br><span class="text-sm" style="color:var(--text-muted);">(~${durationText})</span>`;
+								}
 							}
 						}
 						} else if (blockHeightEl) {
@@ -1160,23 +1195,34 @@
 						networkHashrate = data.block_difficulty * 4294967296 / (10 * 60);
 					}
 					if (networkHashrateEl) {
-						const networkHashrateText = networkHashrate ? formatHashrate(networkHashrate) : '--';
-						networkHashrateEl.textContent = networkHashrateText;
+						if (IS_REGTEST) {
+							networkHashrateEl.textContent = 'N/A';
+						} else {
+							const networkHashrateText = networkHashrate ? formatHashrate(networkHashrate) : '--';
+							networkHashrateEl.textContent = networkHashrateText;
+						}
 					}
 					if (blockChanceEl) {
-						let chanceText = '--';
-						if (networkHashrate && typeof data.pool_hashrate === 'number' && data.pool_hashrate > 0) {
-							const share = Math.min(1, data.pool_hashrate / networkHashrate);
-							const chance = 1 - Math.pow(1 - share, BLOCKS_PER_YEAR);
-							chanceText = formatOddsText(chance);
+						if (IS_REGTEST) {
+							blockChanceEl.textContent = 'N/A';
+						} else {
+							let chanceText = '--';
+							if (networkHashrate && typeof data.pool_hashrate === 'number' && data.pool_hashrate > 0) {
+								const share = Math.min(1, data.pool_hashrate / networkHashrate);
+								const chance = 1 - Math.pow(1 - share, BLOCKS_PER_YEAR);
+								chanceText = formatOddsText(chance);
+							}
+							blockChanceEl.textContent = chanceText;
 						}
-						blockChanceEl.textContent = chanceText;
 					}
 					if (blockTimeLeftEl) {
 						let secondsLeft = null;
+						const expectedIntervalSec = IS_REGTEST
+							? derivedExpectedBlockIntervalSec(data.recent_block_times)
+							: 10 * 60;
 
-						// Try to use block_time_left_sec from server if available
-						if (typeof data.block_time_left_sec === 'number' && data.block_time_left_sec >= 0) {
+						// On non-regtest networks, server-supplied timer is authoritative.
+						if (!IS_REGTEST && typeof data.block_time_left_sec === 'number' && data.block_time_left_sec >= 0) {
 							secondsLeft = data.block_time_left_sec;
 							const updatedMillis = getUpdatedAtMillis(updatedAt || data.updated_at);
 							if (updatedMillis !== null) {
@@ -1187,7 +1233,7 @@
 						// Fall back to calculating from most recent block timestamp
 						else if (data.recent_block_times && data.recent_block_times.length > 0) {
 							const mostRecentBlockTime = new Date(data.recent_block_times[data.recent_block_times.length - 1]).getTime();
-							const targetInterval = 10 * 60 * 1000; // 10 minutes in ms
+							const targetInterval = expectedIntervalSec * 1000;
 							const expectedEndTime = mostRecentBlockTime + targetInterval;
 							secondsLeft = Math.floor((expectedEndTime - Date.now()) / 1000);
 						}

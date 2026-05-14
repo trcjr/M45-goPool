@@ -614,7 +614,7 @@ func (mc *MinerConn) sendInitialWork() {
 		logger.Info("initial notify not sent", "component", "miner", "kind", "lifecycle", "remote", mc.id, "reason", "no current job after refresh")
 		return
 	}
-	if !mc.sendNotifyFor(job, true) {
+	if !mc.sendNotifyForWithReason(job, true, "initial") {
 		logger.Warn("initial notify not sent", "component", "miner", "kind", "lifecycle", "remote", mc.id, "reason", "notify write failed", "job_id", job.JobID)
 		return
 	}
@@ -653,6 +653,7 @@ func (mc *MinerConn) listenJobs() {
 	}()
 
 	for job := range mc.jobCh {
-		mc.sendNotifyFor(job, false)
+		reason := notifyReasonOrDefault(job.NotifyReason, job.Clean)
+		mc.sendNotifyForWithReason(job, false, reason)
 	}
 }

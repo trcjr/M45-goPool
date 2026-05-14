@@ -208,9 +208,6 @@ func (mc *MinerConn) maybeUpdateSavedWorkerMinuteBestDiff(diff float64, now time
 	if hash == "" {
 		return
 	}
-	if !mc.savedWorkerTracked {
-		return
-	}
 	mc.savedWorkerStore.UpdateSavedWorkerMinuteBestDifficulty(hash, diff, now)
 }
 

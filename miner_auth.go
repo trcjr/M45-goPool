@@ -929,7 +929,7 @@ func (mc *MinerConn) maybeSendCleanJobAfterSuggest() {
 	}
 	if mc.jobMgr != nil {
 		if job := mc.jobMgr.CurrentJob(); job != nil {
-			mc.sendNotifyFor(job, true)
+			mc.sendNotifyForWithReason(job, true, "template_update")
 		}
 	}
 }
@@ -1154,10 +1154,28 @@ func (mc *MinerConn) handleConfigure(req *StratumRequest) {
 	// for miners that don't send configure/suggest_* during handshake.
 	mc.maybeSendInitialWork()
 }
+func notifyReasonOrDefault(reason string, clean bool) string {
+	reason = strings.TrimSpace(reason)
+	if reason != "" {
+		return reason
+	}
+	if clean {
+		return "tip_update"
+	}
+	return "template_update"
+}
 
 func (mc *MinerConn) sendNotifyFor(job *Job, forceClean bool) bool {
+	return mc.sendNotifyForWithReason(job, forceClean, "")
+}
+
+func (mc *MinerConn) sendNotifyForWithReason(job *Job, forceClean bool, reason string) bool {
 	if !mc.subscribed {
 		return false
+	}
+	reason = notifyReasonOrDefault(reason, job != nil && job.Clean)
+	if reason == "accepted_block" {
+		forceClean = true
 	}
 	// Opportunistically adjust difficulty before notifying about the job.
 	// If difficulty changed, force clean so the miner uses the new difficulty.
@@ -1300,6 +1318,18 @@ func (mc *MinerConn) sendNotifyFor(job *Job, forceClean bool) bool {
 		cleanJobs,
 	}
 
+	logFields := []any{
+		"component", "miner",
+		"kind", "notify",
+		"remote", mc.id,
+		"session", mc.currentSessionID(),
+		"worker", worker,
+		"job_id", stratumJobID,
+		"height", job.Template.Height,
+		"clean_jobs", cleanJobs,
+		"reason", reason,
+	}
+
 	if debugLogging || verboseRuntimeLogging {
 		merkleRoot := computeMerkleRootBE(coinb1, coinb2, job.MerkleBranches)
 		headerHashLE := headerHashFromNotify(prevhashLE, merkleRoot, uint32(job.Template.Version), job.Template.Bits, job.Template.CurTime)
@@ -1325,10 +1355,11 @@ func (mc *MinerConn) sendNotifyFor(job *Job, forceClean bool) bool {
 		Method: "mining.notify",
 		Params: params,
 	}); err != nil {
-		logger.Error("notify write error", "component", "miner", "kind", "notify", "remote", mc.id, "error", err)
+		logger.Warn("notify send failed", append(logFields, "error", err)...)
 		return false
 	}
 	mc.recordNotifySent(time.Now())
+	logger.Info("notify sent", logFields...)
 	return true
 }
 

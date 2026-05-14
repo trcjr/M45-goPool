@@ -76,10 +76,10 @@ func (s *StatusServer) handleSparkMinerStats(w http.ResponseWriter, r *http.Requ
 // buildSparkMinerStats constructs the SparkMiner stats response.
 func (s *StatusServer) buildSparkMinerStats(wallet, worker string) *SparkMinerStats {
 	stats := &SparkMinerStats{}
-	now := time.Now()
 
 	// Get current view of pool status
 	view := s.statusDataView()
+	windowDifficulty := 0.0
 
 	// 1. BTC Price
 	if s.priceSvc != nil {
@@ -164,6 +164,20 @@ func (s *StatusServer) buildSparkMinerStats(wallet, worker string) *SparkMinerSt
 					diffStr := formatDiffValue(entry.Difficulty)
 					stats.AddressBestDiff = &diffStr
 				}
+
+				if entry.WindowDifficulty > 0 {
+					windowDifficulty = entry.WindowDifficulty
+				}
+			}
+		}
+	}
+
+	// If no wallet-specific window difficulty is available, estimate pool-wide
+	// window difficulty by summing worker windows.
+	if windowDifficulty <= 0 {
+		for _, w := range view.Workers {
+			if w.WindowDifficulty > 0 {
+				windowDifficulty += w.WindowDifficulty
 			}
 		}
 	}
@@ -189,9 +203,16 @@ func (s *StatusServer) buildSparkMinerStats(wallet, worker string) *SparkMinerSt
 		// Difficulty change (previous vs current difficulty)
 		// This is a simplified estimate based on window performance
 		// In a real implementation, this would come from VarDiff calculation
-		if view.WindowDifficulty > 0 && view.MinDifficulty > 0 {
-			change := ((view.WindowDifficulty - view.MinDifficulty) / view.MinDifficulty) * 100
-			stats.DifficultyChange = &change
+		if view.MinDifficulty > 0 {
+			if windowDifficulty > 0 {
+				change := ((windowDifficulty - view.MinDifficulty) / view.MinDifficulty) * 100
+				stats.DifficultyChange = &change
+			} else if view.WindowSubmissions > 0 {
+				// Fallback estimate when detailed window difficulty is unavailable.
+				acceptanceRatio := float64(view.WindowAccepted) / float64(view.WindowSubmissions)
+				change := (acceptanceRatio - 1.0) * 100
+				stats.DifficultyChange = &change
+			}
 		}
 
 		// Difficulty retarget blocks (estimate based on share rate)
@@ -252,5 +273,3 @@ func estimateNetworkHashrate(difficulty float64) float64 {
 	)
 	return difficulty * difficulty1Hashrate
 }
-
-const defaultFiatCurrency = "usd"

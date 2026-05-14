@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"fmt"
 	"math"
@@ -131,6 +132,11 @@ func (mc *MinerConn) handleBlockShare(reqID any, job *Job, stratumJobID string, 
 		mc.metrics.RecordBlockSubmission("accepted")
 	}
 
+	// Submit acknowledgment must be emitted before any accepted-block refresh
+	// notify fanout so miners see submit success first.
+	mc.writeTrueResponse(reqID)
+	mc.triggerAcceptedBlockRefresh(job)
+
 	// For solo mining, treat the worker that submitted the block as the
 	// beneficiary of the block reward. We always split the reward between
 	// the pool fee and worker payout for logging purposes.
@@ -176,7 +182,19 @@ func (mc *MinerConn) handleBlockShare(reqID any, job *Job, stratumJobID string, 
 			"worker_difficulty", stats.TotalDifficulty,
 		)
 	}
-	mc.writeTrueResponse(reqID)
+}
+
+func (mc *MinerConn) triggerAcceptedBlockRefresh(job *Job) {
+	if mc == nil || mc.jobMgr == nil || job == nil {
+		return
+	}
+	go func(height int64) {
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		defer cancel()
+		if err := mc.jobMgr.refreshAfterAcceptedBlock(ctx, height); err != nil {
+			logger.Warn("accepted block refresh failed", "component", "miner", "kind", "job_refresh", "remote", mc.id, "height", height, "error", err)
+		}
+	}(job.Template.Height)
 }
 
 // logFoundBlock appends a JSON line describing a found block to a log file in

@@ -124,12 +124,14 @@ func (s *StatusServer) recordSavedOnlineWorkerPeriods(allWorkers []WorkerView, n
 	}
 
 	hashrateByHash := make(map[string]float64, len(savedHashes))
+	onlineAll := make(map[string]struct{}, len(allWorkers))
 	onlineSaved := make(map[string]struct{}, len(savedHashes))
 	for _, w := range allWorkers {
 		hash := strings.ToLower(strings.TrimSpace(w.WorkerSHA256))
 		if hash == "" {
 			continue
 		}
+		onlineAll[hash] = struct{}{}
 		if _, ok := savedHashes[hash]; !ok {
 			// Backfill history for legacy saved-worker rows that were stored
 			// without a hash by matching active worker names.
@@ -176,21 +178,30 @@ func (s *StatusServer) recordSavedOnlineWorkerPeriods(allWorkers []WorkerView, n
 	poolRing.hashrateQ[poolIdx] = encodeHashrateSI16(poolHashrate)
 	poolRing.lastMinute = sampleMinute
 
+	var poolBestQ uint16
+	bestQByHash := make(map[string]uint16, len(onlineAll))
+	if s.workerLists != nil {
+		for hash := range onlineAll {
+			bestQ := encodeBestShareSI16(s.workerLists.ConsumeSavedWorkerMinuteBestDifficulty(hash, sampleBucket))
+			if bestQ > 0 {
+				bestQByHash[hash] = bestQ
+			}
+			if bestQ > poolBestQ {
+				poolBestQ = bestQ
+			}
+		}
+	}
+	if poolBestQ > poolRing.bestDifficultyQ[poolIdx] {
+		poolRing.bestDifficultyQ[poolIdx] = poolBestQ
+	}
+
 	if len(onlineSaved) == 0 {
 		s.pruneSavedWorkerPeriodsLocked(currentMinute)
 		return
 	}
-
-	var poolBestQ uint16
 	for hash := range onlineSaved {
 		hashrateQ := encodeHashrateSI16(hashrateByHash[hash])
-		bestQ := uint16(0)
-		if s.workerLists != nil {
-			bestQ = encodeBestShareSI16(s.workerLists.ConsumeSavedWorkerMinuteBestDifficulty(hash, sampleBucket))
-		}
-		if bestQ > poolBestQ {
-			poolBestQ = bestQ
-		}
+		bestQ := bestQByHash[hash]
 		ring := s.savedWorkerPeriods[hash]
 		if ring == nil {
 			ring = &savedWorkerPeriodRing{}
@@ -210,9 +221,6 @@ func (s *StatusServer) recordSavedOnlineWorkerPeriods(allWorkers []WorkerView, n
 			ring.bestDifficultyQ[idx] = bestQ
 		}
 		ring.lastMinute = sampleMinute
-	}
-	if poolBestQ > poolRing.bestDifficultyQ[poolIdx] {
-		poolRing.bestDifficultyQ[poolIdx] = poolBestQ
 	}
 	s.pruneSavedWorkerPeriodsLocked(currentMinute)
 }

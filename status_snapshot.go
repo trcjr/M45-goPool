@@ -582,7 +582,24 @@ func mergeWorkerViewsByHash(views []WorkerView) []WorkerView {
 
 func (s *StatusServer) computePoolHashrate() float64 {
 	if s.metrics != nil {
-		return s.metrics.PoolHashrate()
+		if h := s.metrics.PoolHashrate(); h > 0 {
+			return h
+		}
+		// Fall back to per-connection registry during EMA bootstrap or when
+		// the metrics aggregate hasn't been updated yet.
+		if s.registry != nil {
+			var total float64
+			for _, mc := range s.registry.Snapshot() {
+				snap := mc.snapshotShareInfo()
+				if snap.RollingHashrate > 0 {
+					total += snap.RollingHashrate
+				}
+			}
+			if total > 0 {
+				return total
+			}
+		}
+		return 0
 	}
 	if s.registry == nil {
 		return 0

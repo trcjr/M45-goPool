@@ -346,7 +346,7 @@
 		const sampledHashrateRows = resampleSeriesByPixel(hashrateRows, minX, spanX, graphWidth, 'max');
 		// Prefer preserving best-share peaks when many buckets collapse into one pixel.
 		const sampledBestRows = resampleSeriesByPixel(bestRows, minX, spanX, graphWidth, 'max');
-		const drawableBestRows = sampledBestRows.filter((row) => Number(row?.value || 0) > 1);
+		const drawableBestRows = sampledBestRows.filter((row) => Number(row?.value || 0) > 0);
 
 		let maxHashrate = 0;
 		for (const row of sampledHashrateRows) if (row.value > maxHashrate) maxHashrate = row.value;
