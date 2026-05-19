@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"encoding/hex"
@@ -355,6 +356,21 @@ func main() {
 	metrics := NewPoolMetrics()
 	metrics.SetStartTime(startTime)
 	metrics.SetBestSharesDB(cfg.DataDir)
+
+	// Load or generate the Stratum V2 NOISE static key.
+	sv2KeyPath := strings.TrimSpace(cfg.StratumV2NoiseKeyPath)
+	if sv2KeyPath == "" {
+		sv2KeyPath = filepath.Join(strings.TrimSpace(cfg.DataDir), "state", "sv2_noise_key.bin")
+		if strings.TrimSpace(cfg.DataDir) == "" {
+			sv2KeyPath = filepath.Join(defaultDataDir, "state", "sv2_noise_key.bin")
+		}
+	}
+	noiseKey, err := loadOrGenerateSV2Key(sv2KeyPath)
+	if err != nil {
+		fatal("sv2 noise key", err)
+	}
+	logger.Info("stratum v2 noise key loaded", "component", "stratum", "kind", "sv2", "pubkey_hex", noiseKey.pubHex())
+
 	clerkVerifier := (*ClerkVerifier)(nil)
 	if clerkConfigured(cfg) {
 		var clerkErr error
@@ -885,17 +901,54 @@ func main() {
 				_ = conn.Close()
 				continue
 			}
-			mc := NewMinerConn(ctx, conn, jobMgr, rpcClient, curCfg, metrics, accounting, workerRegistry, workerLists, notifier, label == "tls")
-			registry.Add(mc)
 
-			connWg.Add(1)
-			go func(mc *MinerConn) {
-				defer connWg.Done()
-				// Always remove connection from the map when this goroutine ends.
-				defer registry.Remove(mc)
+			// Peek at the first byte to detect Stratum V2 vs V1.
+			reader := bufio.NewReaderSize(conn, maxStratumMessageSize)
+			peeked, peekErr := reader.Peek(1)
+			if peekErr != nil {
+				_ = conn.Close()
+				continue
+			}
+			firstByte := peeked[0]
+			// SV1 JSON messages start with '{' (0x7B).
+			// SV2 unencrypted frames start with any byte (extension_type LE u16 + msg_type).
+			// SV2 NOISE handshake starts with a compressed public key: 0x02 or 0x03.
+			isSV1 := firstByte == '{'
+			isEncryptedSV2 := firstByte == 0x02 || firstByte == 0x03
 
-				mc.handle()
-			}(mc)
+			if isSV1 {
+				mc := NewMinerConn(ctx, conn, jobMgr, rpcClient, curCfg, metrics, accounting, workerRegistry, workerLists, notifier, label == "tls", reader)
+				registry.Add(mc)
+				connWg.Add(1)
+				go func(mc *MinerConn) {
+					defer connWg.Done()
+					defer registry.Remove(mc)
+					mc.handle()
+				}(mc)
+			} else if isEncryptedSV2 {
+				encConn, noiseErr := sv2NoiseHandshake(conn, noiseKey)
+				if noiseErr != nil {
+					logger.Warn("sv2 noise handshake failed", "component", "stratum", "kind", "sv2",
+						"listener", label, "remote", conn.RemoteAddr().String(), "error", noiseErr)
+					_ = conn.Close()
+					continue
+				}
+				sv2c := NewSV2Conn(encConn, jobMgr, rpcClient, curCfg, metrics, accounting, workerRegistry, workerLists, label == "tls")
+				connWg.Add(1)
+				go func() {
+					defer connWg.Done()
+					sv2c.handle()
+				}()
+			} else {
+				// Unencrypted SV2: reuse the peeked reader
+				sv2c := NewSV2Conn(conn, jobMgr, rpcClient, curCfg, metrics, accounting, workerRegistry, workerLists, label == "tls")
+				sv2c.reader = reader
+				connWg.Add(1)
+				go func() {
+					defer connWg.Done()
+					sv2c.handle()
+				}()
+			}
 		}
 	}
 	// Plain Stratum listener runs in the main goroutine so process

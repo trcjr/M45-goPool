@@ -259,6 +259,9 @@ func applyBaseConfig(cfg *Config, fc baseFileConfigRead) (configChanged bool, mi
 	}
 	cfg.StratumPasswordPublic = fc.Stratum.StratumPasswordPublic
 	cfg.SafeMode = fc.Stratum.SafeMode
+	if fc.Stratum.StratumV2NoiseKeyPath != "" {
+		cfg.StratumV2NoiseKeyPath = strings.TrimSpace(fc.Stratum.StratumV2NoiseKeyPath)
+	}
 	if fc.Node.RPCURL != "" {
 		cfg.RPCURL = fc.Node.RPCURL
 	}

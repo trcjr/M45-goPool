@@ -13,8 +13,8 @@ func newStatusServerForSparkMinerTests() *StatusServer {
 		jsonCache: make(map[string]cachedJSONResponse),
 	}
 	s.UpdateConfig(Config{
-		FiatCurrency: "USD",
-		BrandName:    "GoPool",
+		FiatCurrency:    "USD",
+		StatusBrandName: "GoPool",
 	})
 	s.statusMu.Lock()
 	s.cachedStatus = StatusData{
@@ -26,7 +26,6 @@ func newStatusServerForSparkMinerTests() *StatusServer {
 		MinDifficulty:      0.001,
 		WindowAccepted:     8,
 		WindowSubmissions:  10,
-		WindowDifficulty:   0.002,
 		JobFeed: JobFeedView{
 			BlockHeight: 881234,
 		},

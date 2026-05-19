@@ -278,6 +278,8 @@ type MinerConn struct {
 	vardiffWindowDifficulty  float64
 	// isTLSConnection tracks whether this miner connected over the TLS listener.
 	isTLSConnection bool
+	// isStratumV2 tracks whether this is a Stratum V2 connection.
+	isStratumV2     bool
 	connectionSeq   uint64
 	// sessionID is an optional client-provided token sometimes sent in
 	// mining.subscribe to allow miners/proxies to resume sessions.

@@ -115,6 +115,7 @@ func TestMinerConn_SubscribeAuthorizeSendsInitialNotifyWithinOneSecond(t *testin
 		nil,
 		nil,
 		false,
+		nil,
 	)
 
 	done := make(chan struct{})

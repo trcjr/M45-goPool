@@ -51,6 +51,9 @@ type Config struct {
 
 	// Stratum TLS (empty to disable).
 	StratumTLSListen string
+	// StratumV2NoiseKeyPath is the path to the Stratum V2 NOISE static key file.
+	// If empty, defaults to <DataDir>/state/sv2_noise_key.bin.
+	StratumV2NoiseKeyPath string
 	// Stratum auth (optional; when enabled, require miners to send the password in mining.authorize).
 	StratumPasswordEnabled bool
 	StratumPassword        string

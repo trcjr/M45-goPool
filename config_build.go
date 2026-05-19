@@ -29,6 +29,7 @@ func buildBaseFileConfig(cfg Config) baseFileConfig {
 			StratumPassword:        cfg.StratumPassword,
 			StratumPasswordPublic:  cfg.StratumPasswordPublic,
 			SafeMode:               cfg.SafeMode,
+			StratumV2NoiseKeyPath:  cfg.StratumV2NoiseKeyPath,
 		},
 		Node: nodeConfig{
 			RPCURL:           cfg.RPCURL,

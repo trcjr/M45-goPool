@@ -97,7 +97,7 @@ func encodeBase58Uint64(value uint64) string {
 	return string(buf[i:])
 }
 
-func NewMinerConn(ctx context.Context, c net.Conn, jobMgr *JobManager, rpc rpcCaller, cfg Config, metrics *PoolMetrics, accounting *AccountStore, workerRegistry *workerConnectionRegistry, workerLists *workerListStore, notifier *discordNotifier, isTLS bool) *MinerConn {
+func NewMinerConn(ctx context.Context, c net.Conn, jobMgr *JobManager, rpc rpcCaller, cfg Config, metrics *PoolMetrics, accounting *AccountStore, workerRegistry *workerConnectionRegistry, workerLists *workerListStore, notifier *discordNotifier, isTLS bool, existingReader *bufio.Reader) *MinerConn {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -138,7 +138,12 @@ func NewMinerConn(ctx context.Context, c net.Conn, jobMgr *JobManager, rpc rpcCa
 		ctx:               ctx,
 		id:                c.RemoteAddr().String(),
 		conn:              c,
-		reader:            bufio.NewReaderSize(c, maxStratumMessageSize),
+		reader: func() *bufio.Reader {
+			if existingReader != nil {
+				return existingReader
+			}
+			return bufio.NewReaderSize(c, maxStratumMessageSize)
+		}(),
 		writeScratch:      make([]byte, 0, 256),
 		jobMgr:            jobMgr,
 		rpc:               rpc,

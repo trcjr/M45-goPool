@@ -40,6 +40,7 @@ type stratumConfig struct {
 	StratumPassword        string `toml:"stratum_password"`
 	StratumPasswordPublic  bool   `toml:"stratum_password_public"`
 	SafeMode               bool   `toml:"safe_mode"`
+	StratumV2NoiseKeyPath  string `toml:"stratum_v2_noise_key_path"`
 }
 
 type authConfig struct {
