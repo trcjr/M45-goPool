@@ -64,7 +64,8 @@ type StatusServer struct {
 	stratumSafeguardDisconnects     []stratumSafeguardDisconnectEvent
 	stratumSafeguardDisconnectCount uint64
 
-	backupSvc *backblazeBackupService
+	backupSvc   *backblazeBackupService
+	sv2NoiseKey *sv2StaticKey
 
 	responseCacheMu sync.RWMutex
 	responseCache   map[string]cachedHTTPResponse
@@ -126,6 +127,13 @@ func (s *StatusServer) SetBackupService(svc *backblazeBackupService) {
 		return
 	}
 	s.backupSvc = svc
+}
+
+func (s *StatusServer) SetSV2NoiseKey(key *sv2StaticKey) {
+	if s == nil {
+		return
+	}
+	s.sv2NoiseKey = key
 }
 
 func (s *StatusServer) ReloadStaticFiles() error {

@@ -134,3 +134,36 @@ func (s *StatusServer) serveOverviewOrNodeDown(w http.ResponseWriter) error {
 	}
 	return nil
 }
+
+// handleWellKnownStratum serves /.well-known/stratum per the SV2 specification.
+// It returns a JSON object containing the pool's NOISE static public key so
+// miners can verify the pool's identity during the NOISE NX handshake without
+// out-of-band key distribution.
+//
+// The "authority_key" field is the Pool Authority Public Key encoded per SV2
+// spec §4.7: base58check([0x01, 0x00] || 32-byte x-only secp256k1 pubkey).
+// Miners embed it in the upstream URL:
+//
+//	stratum2+tcp://pool.example.com:3333/<authority_key>
+func (s *StatusServer) handleWellKnownStratum(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s == nil || s.sv2NoiseKey == nil {
+		http.Error(w, "stratum v2 not configured", http.StatusNotFound)
+		return
+	}
+	pubHex := s.sv2NoiseKey.pubHex()
+	authorityKey := s.sv2NoiseKey.authKeyBase58Check()
+	payload := fmt.Sprintf(
+		"{\"noise_pubkey\":%q,\"authority_key\":%q,\"protocol\":\"Noise_NX_secp256k1_ChaChaPoly_SHA256\",\"version\":2}\n",
+		pubHex, authorityKey,
+	)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		_, _ = w.Write([]byte(payload))
+	}
+}

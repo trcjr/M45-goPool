@@ -10,15 +10,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
  && rm -rf /var/lib/apt/lists/*
 
-COPY go.mod go.sum ./
-RUN go mod download
 
+
+# Copy go.mod and go.sum, tidy dependencies
+COPY go.mod go.sum ./
+RUN go mod tidy
+
+# Copy the rest of the source code (excluding vendor)
 COPY . .
+
+# Vendor dependencies inside the container
+RUN go mod vendor
 
 ARG BUILD_TIME=unknown
 ARG BUILD_VERSION=v0.0.0-dev
 
 RUN CGO_ENABLED=1 go build \
+    -mod=vendor \
     -trimpath \
     -ldflags="-s -w -X main.buildTime=${BUILD_TIME} -X main.buildVersion=${BUILD_VERSION}" \
     -o /out/goPool .

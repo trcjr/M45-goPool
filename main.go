@@ -369,7 +369,7 @@ func main() {
 	if err != nil {
 		fatal("sv2 noise key", err)
 	}
-	logger.Info("stratum v2 noise key loaded", "component", "stratum", "kind", "sv2", "pubkey_hex", noiseKey.pubHex())
+	logger.Info("stratum v2 noise key loaded", "component", "stratum", "kind", "sv2", "pubkey_hex", noiseKey.pubHex(), "authority_key", noiseKey.authKeyBase58Check())
 
 	clerkVerifier := (*ClerkVerifier)(nil)
 	if clerkConfigured(cfg) {
@@ -468,6 +468,7 @@ func main() {
 		logger.Warn("saved-workers local no-auth mode enabled", "flag", "saved-workers-local-noauth")
 	}
 	statusServer.SetBackupService(backupSvc)
+	statusServer.SetSV2NoiseKey(noiseKey)
 	statusServer.startOneTimeCodeJanitor(ctx)
 	statusServer.loadOneTimeCodesFromDB(cfg.DataDir)
 	statusServer.startOneTimeCodePersistence(ctx)
@@ -555,6 +556,8 @@ func main() {
 	}
 	// SparkMiner unified stats endpoint (always enabled, lightweight, no auth required)
 	mux.HandleFunc("/stats", statusServer.handleSparkMinerStats)
+	// SV2 NOISE public key discovery (RFC 8615 well-known URI, always enabled)
+	mux.HandleFunc("/.well-known/stratum", statusServer.handleWellKnownStratum)
 	// HTML endpoints
 	mux.HandleFunc("/admin", statusServer.handleAdminPage)
 	mux.HandleFunc("/admin/miners", statusServer.handleAdminMinersPage)
