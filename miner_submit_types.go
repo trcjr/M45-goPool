@@ -13,7 +13,9 @@ type shareContext struct {
 	header     []byte
 	cbTx       []byte
 	merkleRoot []byte
-	hashLE     []byte
+	headerHashBE [32]byte
+	headerHashLE [32]byte
+	hashLE       []byte
 	hashHex    string
 	shareDiff  float64
 	isBlock    bool

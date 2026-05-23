@@ -371,6 +371,49 @@ func (mc *MinerConn) currentDifficulty() float64 {
 	return atomicLoadFloat64(&mc.difficulty)
 }
 
+func (mc *MinerConn) currentJobSnapshot() *Job {
+	mc.jobMu.Lock()
+	defer mc.jobMu.Unlock()
+	return mc.lastJob
+}
+
+func (mc *MinerConn) capDifficultyForJob(requestedDiff float64, job *Job, worker string) float64 {
+	networkDiff, ok, err := networkDifficultyFromJob(job)
+	if !ok {
+		if err != nil {
+			logger.Warn("share difficulty cap skipped",
+				"component", "stratum",
+				"kind", "sv1",
+				"worker", worker,
+				"requested_share_diff_bdiff", requestedDiff,
+				"reason", "invalid-network-difficulty",
+				"error", err)
+		}
+		return requestedDiff
+	}
+	effective, capped, networkValid := capShareDifficultyByNetwork(requestedDiff, networkDiff)
+	if !networkValid {
+		logger.Warn("share difficulty cap skipped",
+			"component", "stratum",
+			"kind", "sv1",
+			"worker", worker,
+			"requested_share_diff_bdiff", requestedDiff,
+			"reason", "invalid-network-difficulty")
+		return requestedDiff
+	}
+	if capped {
+		logger.Debug("share difficulty capped by network",
+			"component", "stratum",
+			"kind", "sv1",
+			"worker", worker,
+			"requested_share_diff_bdiff", requestedDiff,
+			"network_diff_bdiff", networkDiff,
+			"effective_share_diff_bdiff", effective,
+			"reason", "network-difficulty-cap")
+	}
+	return effective
+}
+
 func (mc *MinerConn) currentShareTarget() *big.Int {
 	target := mc.shareTarget.Load()
 	if target == nil || target.Sign() <= 0 {
@@ -681,6 +724,9 @@ func (mc *MinerConn) trackJob(job *Job, stratumJobID string, clean bool) {
 		}
 		delete(mc.shareCache, oldest)
 		delete(mc.jobDifficulty, oldest)
+		if mc.jobRequestedDifficulty != nil {
+			delete(mc.jobRequestedDifficulty, oldest)
+		}
 	}
 
 	if dupEnabled && mc.evictedShareCache != nil {
@@ -733,15 +779,21 @@ func (mc *MinerConn) jobForIDWithLast(jobID string) (job *Job, lastJob *Job, las
 	return job, mc.lastJob, mc.lastJobPrevHash, mc.lastJobHeight, ntimeBounds, scriptTime, ok
 }
 
-func (mc *MinerConn) setJobDifficulty(jobID string, diff float64) {
-	if jobID == "" || diff <= 0 {
+func (mc *MinerConn) setJobDifficulty(jobID string, effectiveDiff float64, requestedDiff float64) {
+	if jobID == "" || effectiveDiff <= 0 {
 		return
 	}
 	mc.jobMu.Lock()
 	if mc.jobDifficulty == nil {
 		mc.jobDifficulty = make(map[string]float64)
 	}
-	mc.jobDifficulty[jobID] = diff
+	mc.jobDifficulty[jobID] = effectiveDiff
+	if requestedDiff > 0 {
+		if mc.jobRequestedDifficulty == nil {
+			mc.jobRequestedDifficulty = make(map[string]float64)
+		}
+		mc.jobRequestedDifficulty[jobID] = requestedDiff
+	}
 	mc.jobMu.Unlock()
 }
 
@@ -754,12 +806,30 @@ func (mc *MinerConn) assignedDifficulty(jobID string) float64 {
 	}
 	mc.jobMu.Lock()
 	diff, ok := mc.jobDifficulty[jobID]
+	job := mc.activeJobs[jobID]
 	mc.jobMu.Unlock()
 	if ok && diff > 0 {
 		return diff
 	}
-
+	if job != nil {
+		return mc.capDifficultyForJob(curDiff, job, mc.currentWorker())
+	}
 	return curDiff
+}
+
+func (mc *MinerConn) requestedDifficultyForJob(jobID string) float64 {
+	if jobID == "" {
+		return mc.currentDifficulty()
+	}
+	mc.jobMu.Lock()
+	defer mc.jobMu.Unlock()
+	if mc.jobRequestedDifficulty == nil {
+		return mc.currentDifficulty()
+	}
+	if diff, ok := mc.jobRequestedDifficulty[jobID]; ok && diff > 0 {
+		return diff
+	}
+	return mc.currentDifficulty()
 }
 
 // meetsPreDiffGrace returns true if the share difficulty is acceptable under
@@ -1413,6 +1483,9 @@ func (mc *MinerConn) clampDifficulty(diff float64) float64 {
 func (mc *MinerConn) setDifficulty(diff float64) {
 	requested := diff
 	diff = mc.clampDifficulty(diff)
+	if job := mc.currentJobSnapshot(); job != nil {
+		diff = mc.capDifficultyForJob(diff, job, mc.currentWorker())
+	}
 	now := time.Now()
 
 	// Atomically update difficulty fields
@@ -1428,6 +1501,7 @@ func (mc *MinerConn) setDifficulty(diff float64) {
 			"miner", mc.minerName(""),
 			"requested_diff", requested,
 			"clamped_diff", diff,
+			"effective_share_diff_bdiff", diff,
 			"share_target", formatBigIntHex64(target),
 		)
 	}

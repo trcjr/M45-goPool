@@ -99,7 +99,8 @@ func validateTransactions(txs []GBTTransaction) ([][]byte, error) {
 			}
 		}
 
-		txids[i] = reverseBytes(computedRaw)
+		// Keep internal/little-endian txid bytes for downstream merkle computation.
+		txids[i] = computedRaw
 	}
 	return txids, nil
 }

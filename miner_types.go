@@ -257,6 +257,9 @@ type MinerConn struct {
 	// was sent to this miner so we can credit shares with the assigned
 	// target even if vardiff changes before the share arrives.
 	jobDifficulty map[string]float64
+	// jobRequestedDifficulty stores the uncapped requested difficulty that was
+	// active when each notify was sent, before network-difficulty capping.
+	jobRequestedDifficulty map[string]float64
 	// rollingHashrateValue holds the current EMA-smoothed hashrate estimate
 	// for this connection, derived from accepted work over time.
 	rollingHashrateValue float64

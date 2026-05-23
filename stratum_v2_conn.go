@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"encoding/hex"
 	"fmt"
 	"math"
@@ -138,14 +140,14 @@ func buildSV2MerkleTrace(coinbaseTxID []byte, branches []string) (sv2MerkleTrace
 
 func txidFromSerializedTx(raw []byte) ([32]byte, error) {
 	var zero [32]byte
-	if len(raw) == 0 {
-		return zero, fmt.Errorf("empty tx")
+	_, txid, consumed, err := parseSerializedTxForSubmitBlock(raw)
+	if err != nil {
+		return zero, err
 	}
-	return doubleSHA256Array(raw), nil
-}
-
-func shareValidationDebugEnabled() bool {
-	return false
+	if consumed != len(raw) {
+		return zero, fmt.Errorf("tx has trailing bytes: consumed=%d total=%d", consumed, len(raw))
+	}
+	return txid, nil
 }
 
 type SV2TraceContext struct {
@@ -797,9 +799,36 @@ func (c *sv2Conn) suggestedStartDiffFromNominalHashrate(nominalHashrate float64)
 }
 
 func (c *sv2Conn) capDifficultyForJob(requestedDiff float64, job *Job) float64 {
-	_ = job
-	// PR2 boundary: network-difficulty share capping is deferred to PR3.
-	return requestedDiff
+	networkDiff, ok, err := networkDifficultyFromJob(job)
+	if !ok {
+		if err != nil {
+			logger.Warn("sv2 share difficulty cap skipped", "component", "stratum", "kind", "sv2",
+				"remote", c.id, "worker", c.workerName,
+				"channel_id", c.channelID,
+				"requested_share_diff_bdiff", requestedDiff,
+				"reason", "invalid-network-difficulty", "error", err)
+		}
+		return requestedDiff
+	}
+	effective, capped, networkValid := capShareDifficultyByNetwork(requestedDiff, networkDiff)
+	if !networkValid {
+		logger.Warn("sv2 share difficulty cap skipped", "component", "stratum", "kind", "sv2",
+			"remote", c.id, "worker", c.workerName,
+			"channel_id", c.channelID,
+			"requested_share_diff_bdiff", requestedDiff,
+			"reason", "invalid-network-difficulty")
+		return requestedDiff
+	}
+	if capped {
+		logger.Debug("share difficulty capped by network", "component", "stratum", "kind", "sv2",
+			"remote", c.id, "worker", c.workerName,
+			"channel_id", c.channelID,
+			"requested_share_diff_bdiff", requestedDiff,
+			"network_diff_bdiff", networkDiff,
+			"effective_share_diff_bdiff", effective,
+			"reason", "network-difficulty-cap")
+	}
+	return effective
 }
 
 func (c *sv2Conn) clampDifficultyWithMinerLimits(diff float64) float64 {
@@ -1743,12 +1772,1436 @@ func (c *sv2Conn) dualPayoutParams(job *Job, workerAddr string, workerScript []b
 }
 
 func (c *sv2Conn) handleSubmit(submit *sv2SubmitSharesStandard, extranonce []byte, minerHeader80 []byte) {
-	_ = extranonce
-	_ = minerHeader80
-	logger.Warn("sv2 submit path deferred", "component", "stratum", "kind", "sv2",
-		"remote", c.id, "channel_id", submit.ChannelID, "seq", submit.SequenceNumber,
-		"job_id", submit.JobID, "reason", "submit-processing-not-enabled-in-pr2")
-	c.sendShareError(submit.ChannelID, submit.SequenceNumber, "unsupported-feature")
+	now := time.Now()
+	submitTrace := BuildSV2Trace(c.newSV2SubmitTraceCtx(submit, nil))
+	logger.Debug("sv2 submit", "component", "stratum", "kind", "sv2", "remote", c.id,
+		"channel_id", submit.ChannelID, "seq", submit.SequenceNumber, "job_id", submit.JobID,
+		"sv2_trace", submitTrace,
+		"nonce", submit.Nonce, "ntime", submit.NTime, "esp_header80_present", len(minerHeader80) == 80,
+		"channel_type", c.channelType)
+	jobIDAny, ok := c.activeJobs.Load(submit.JobID)
+	if !ok {
+		logger.Warn("sv2 handleSubmit: job not found", "jobID", submit.JobID, "sv2_trace", submitTrace)
+		c.logSV2StaleOrPausedWork(submit, nil, minerHeader80, "job-not-found")
+		c.recordShare(c.workerName, false, 0, 0, "stale job", "", now)
+		c.sendShareError(submit.ChannelID, submit.SequenceNumber, "job-not-found")
+		return
+	}
+	info := jobIDAny.(*sv2JobInfo)
+	job := info.job
+	submitTrace = BuildSV2Trace(c.newSV2SubmitTraceCtx(submit, info))
+	if latestJobID, _, hasLatest := c.latestActiveSV2Job(); hasLatest && latestJobID != submit.JobID {
+		c.logSV2StaleOrPausedWork(submit, job, minerHeader80, "stale-job-after-new-job-issued")
+	}
+	if hs := stratumHealthStatus(c.jobMgr, now); !hs.Healthy {
+		reason := strings.TrimSpace(hs.Reason)
+		if reason == "" {
+			reason = "pool-not-healthy"
+		}
+		c.logSV2StaleOrPausedWork(submit, job, minerHeader80, reason)
+	}
+	uncappedRequestedDiff := info.requestedDiff
+	assignedDiff := info.assignedDiff
+	assignedTargetLE := info.assignedTarget
+	if uncappedRequestedDiff <= 0 {
+		uncappedRequestedDiff = assignedDiff
+	}
+	if assignedDiff <= 0 {
+		uncappedRequestedDiff = c.difficulty
+		assignedDiff = c.capDifficultyForJob(c.difficulty, job)
+		assignedTargetLE = c.targetForDifficulty(assignedDiff)
+	}
+	if sv2TargetIsZero(assignedTargetLE) {
+		assignedTargetLE = c.targetForDifficulty(assignedDiff)
+	}
+	standardExtranonce := append([]byte(nil), info.standardExtranonce...)
+	if len(standardExtranonce) == 0 {
+		standardExtranonce = make([]byte, 0, len(c.extranonce1)+job.Extranonce2Size)
+		standardExtranonce = append(standardExtranonce, c.extranonce1...)
+		if job.Extranonce2Size > 0 {
+			standardExtranonce = append(standardExtranonce, make([]byte, job.Extranonce2Size)...)
+		}
+	}
+
+	variants := make([]sv2SubmitVariant, 0, 3)
+	if c.isExtended {
+		// Extended submit interoperability:
+		// - Some firmware sends only the mutable tail.
+		// - Some firmware sends the full extranonce blob used for hashing.
+		// - Some firmware interprets extranonce_size as total (prefix+tail),
+		//   then sends that full total-size blob in submit.
+		tailLen := int(c.extranonceSize)
+		fullLen := len(c.extranonce1) + tailLen
+		switch len(extranonce) {
+		case fullLen:
+			if !bytes.Equal(extranonce[:len(c.extranonce1)], c.extranonce1) {
+				logger.Warn("sv2 invalid extended extranonce prefix", "component", "stratum", "kind", "sv2", "remote", c.id,
+					"sv2_trace", func() string {
+						tCtx := c.newSV2SubmitTraceCtx(submit, info)
+						tCtx.Result = "rejected"
+						tCtx.Reason = "bad-extranonce-prefix"
+						return BuildSV2Trace(tCtx)
+					}())
+				c.sendShareError(submit.ChannelID, submit.SequenceNumber, "bad-extranonce-prefix")
+				return
+			}
+			variants = append(variants, sv2SubmitVariant{
+				name:            "tail_only",
+				en1:             c.extranonce1,
+				en2:             extranonce[len(c.extranonce1):],
+				extranonce2Size: tailLen,
+				templateEx2Size: tailLen,
+			})
+			variants = append(variants, sv2SubmitVariant{
+				name:            "prefix_plus_tail",
+				en1:             c.extranonce1,
+				en2:             extranonce[len(c.extranonce1):],
+				extranonce2Size: tailLen,
+				templateEx2Size: tailLen,
+			})
+		case tailLen:
+			variants = append(variants, sv2SubmitVariant{
+				name:            "tail_only",
+				en1:             c.extranonce1,
+				en2:             extranonce,
+				extranonce2Size: tailLen,
+				templateEx2Size: tailLen,
+			})
+			if false {
+				if len(c.extranonce1) > 0 && len(extranonce) > len(c.extranonce1) && bytes.Equal(extranonce[:len(c.extranonce1)], c.extranonce1) {
+					totalTail := len(extranonce) - len(c.extranonce1)
+					variants = append(variants, sv2SubmitVariant{
+						name:            "total_size_with_prefix",
+						en1:             c.extranonce1,
+						en2:             extranonce[len(c.extranonce1):],
+						extranonce2Size: totalTail,
+						templateEx2Size: totalTail,
+					})
+				}
+				variants = append(variants, sv2SubmitVariant{
+					name:            "full_submitted",
+					en1:             nil,
+					en2:             extranonce,
+					extranonce2Size: len(extranonce),
+					templateEx2Size: len(extranonce),
+				})
+				// Diagnostic: miner ignores ExtraNoncePrefix and uses all-zero en1.
+				if len(c.extranonce1) > 0 {
+					zeroEn1 := make([]byte, len(c.extranonce1))
+					variants = append(variants, sv2SubmitVariant{
+						name:            "zeroed_en1",
+						en1:             zeroEn1,
+						en2:             extranonce,
+						extranonce2Size: tailLen,
+						templateEx2Size: tailLen,
+					})
+					// Diagnostic: miner sends en1 in reversed byte order.
+					revEn1 := append([]byte(nil), c.extranonce1...)
+					for i, j := 0, len(revEn1)-1; i < j; i, j = i+1, j-1 {
+						revEn1[i], revEn1[j] = revEn1[j], revEn1[i]
+					}
+					if !bytes.Equal(revEn1, c.extranonce1) {
+						variants = append(variants, sv2SubmitVariant{
+							name:            "en1_reversed",
+							en1:             revEn1,
+							en2:             extranonce,
+							extranonce2Size: tailLen,
+							templateEx2Size: tailLen,
+						})
+					}
+				}
+			}
+		default:
+			logger.Warn("sv2 invalid extended extranonce size", "component", "stratum", "kind", "sv2", "remote", c.id,
+				"got", len(extranonce), "want_full", fullLen, "want_tail", tailLen,
+				"sv2_trace", func() string {
+					tCtx := c.newSV2SubmitTraceCtx(submit, info)
+					tCtx.Result = "rejected"
+					tCtx.Reason = "bad-extranonce-size"
+					return BuildSV2Trace(tCtx)
+				}())
+			c.sendShareError(submit.ChannelID, submit.SequenceNumber, "bad-extranonce-size")
+			return
+		}
+	} else {
+		// Standard channels are header-only mining. Keep a single deterministic mode.
+		variants = append(variants, sv2SubmitVariant{
+			name:            "standard_direct",
+			en1:             standardExtranonce,
+			en2:             nil,
+			extranonce2Size: 0,
+			templateEx2Size: 0,
+		})
+	}
+	// Some downstream firmware uses different byte ordering conventions when
+	// serializing extranonce bytes in submits. Try a small compatibility set.
+	if c.isExtended && false {
+		expanded := make([]sv2SubmitVariant, 0, len(variants)*4)
+		for _, v := range variants {
+			expanded = append(expanded, v)
+
+			if len(v.en2) > 1 {
+				rev := append([]byte(nil), v.en2...)
+				for i, j := 0, len(rev)-1; i < j; i, j = i+1, j-1 {
+					rev[i], rev[j] = rev[j], rev[i]
+				}
+				if !bytes.Equal(rev, v.en2) {
+					nv := v
+					nv.name = v.name + "_rev"
+					nv.en2 = rev
+					expanded = append(expanded, nv)
+				}
+			}
+
+			if len(v.en2) >= 4 {
+				dword := append([]byte(nil), v.en2...)
+				dword[0], dword[1], dword[2], dword[3] = dword[3], dword[2], dword[1], dword[0]
+				if !bytes.Equal(dword, v.en2) {
+					nv := v
+					nv.name = v.name + "_dword0"
+					nv.en2 = dword
+					expanded = append(expanded, nv)
+				}
+			}
+
+			if len(v.en2) >= 2 {
+				pair := append([]byte(nil), v.en2...)
+				for i := 0; i+1 < len(pair); i += 2 {
+					pair[i], pair[i+1] = pair[i+1], pair[i]
+				}
+				if !bytes.Equal(pair, v.en2) {
+					nv := v
+					nv.name = v.name + "_pairswap"
+					nv.en2 = pair
+					expanded = append(expanded, nv)
+				}
+			}
+		}
+		variants = expanded
+	}
+
+	ntimeHex := fmt.Sprintf("%08x", submit.NTime)
+	nonceHex := fmt.Sprintf("%08x", submit.Nonce)
+	ntimeHexes := []string{ntimeHex}
+	nonceHexes := []string{nonceHex}
+	// SV2 submit fields are already decoded from little-endian wire values into
+	// host uint32s. Re-trying byte-swapped nTime/nonce variants can produce
+	// headers that look low-diff but are invalid to bitcoind (for example,
+	// submitblock "time-too-new").
+	// Only accept canonical prevhash/bits from the active template. Permissive
+	// byte-swap fallbacks can produce headers that don't extend the node's tip
+	// and lead to submitblock rejections such as "prev-blk-not-found".
+	prevHexes := []string{job.Template.Previous}
+	bitsHexes := []string{job.Template.Bits}
+	versionMask := job.VersionMask
+	if versionMask == 0 {
+		versionMask = c.cfg.VersionMask
+	}
+	versionResolution := resolveSubmittedVersion(uint32(job.Template.Version), submit.Version, versionMask, true)
+	versionsToTry := []uint32{versionResolution.useVersion}
+	if versionResolution.hasAlternateVersion {
+		versionsToTry = append(versionsToTry, versionResolution.alternateUseVersion)
+	}
+	scriptTimesToTry := []int64{job.ScriptTime}
+	submitScriptTime := int64(submit.NTime)
+	if submitScriptTime > 0 && submitScriptTime != scriptTimesToTry[0] {
+		scriptTimesToTry = append(scriptTimesToTry, submitScriptTime)
+	}
+
+	shareTargetBE := uint256BEFromBigInt(sv2TargetLEToBigInt(assignedTargetLE))
+	hasNetworkTarget := job.Target != nil && job.Target.Sign() > 0
+	var networkTargetBE [32]byte
+	if hasNetworkTarget {
+		networkTargetBE = uint256BEFromBigInt(job.Target)
+	}
+	shareThreshold := assignedDiff
+	if shareThreshold <= 0 {
+		shareThreshold = defaultMinDifficulty
+	}
+	var (
+		blockHex      string
+		headerHashLE  [32]byte
+		headerHashRaw [32]byte
+		hashHex       string
+		selectedVer   uint32
+		selectedMode  string
+		selectedDiff  float64
+		selectedSTime int64
+		selectedNTime string
+		selectedNonce string
+		selectedPrev  string
+		selectedBits  string
+		selectedMerkleRootWireLE string
+		selectedMerkleRootDisplayBE string
+		selectedHeaderHex string
+		selectedCoinbasePrefixHex string
+		selectedCoinbaseSuffixHex string
+		selectedFullCoinbaseHex string
+		selectedCoinbaseTxIDDisplayBE string
+		selectedCoinbaseTxIDLE string
+		selectedMerkleLayersWireLE []string
+		selectedMerkleLayersBE []string
+		selectedBranches []string
+		selectedEn2   []byte
+		selectedModeExperimental bool
+		selectedSubmitCoinbaseTxIDWireLE string
+		selectedSubmitMerkleRootWireLE string
+		selectedHeaderMerkleRootWireLE string
+		selectedSubmitTxIDsWireLE []string
+		selectedSubmitTxCount int
+		selectedSubmitMerkleMatchesHeader bool
+		acceptedShare bool
+		maxTriedDiff  float64
+		maxTriedMode  string
+		maxTriedHash  string
+	)
+	candidateHeaderModes := make(map[string][]string)
+	// Decode the coinbase halves that were pre-built in sendJob and sent to the
+	// miner. Using these directly (rather than re-serialising from PayoutScript)
+	// ensures we hash the exact same multi-output coinbase the miner hashed.
+	coinb1Bytes, coinb1Err := hex.DecodeString(info.coinb1)
+	coinb2Bytes, coinb2Err := hex.DecodeString(info.coinb2)
+	if coinb1Err != nil || coinb2Err != nil {
+		logger.Warn("sv2 decode coinbase parts", "component", "stratum", "kind", "sv2",
+			"remote", c.id, "coinb1_err", coinb1Err, "coinb2_err", coinb2Err)
+		c.sendShareError(submit.ChannelID, submit.SequenceNumber, "internal-error")
+		return
+	}
+	type sv2CoinbaseAttempt struct {
+		scriptTime int64
+		coinb1     []byte
+		coinb2     []byte
+		fixedCoinbase []byte
+	}
+	coinbaseAttempts := make([]sv2CoinbaseAttempt, 0, 2)
+	if c.isExtended {
+		coinbaseAttempts = append(coinbaseAttempts, sv2CoinbaseAttempt{scriptTime: job.ScriptTime, coinb1: coinb1Bytes, coinb2: coinb2Bytes})
+	} else {
+		fixedStandardCoinbase := append([]byte(nil), info.standardCoinbaseTx...)
+		if len(fixedStandardCoinbase) == 0 {
+			fixedStandardCoinbase = make([]byte, 0, len(coinb1Bytes)+len(standardExtranonce)+len(coinb2Bytes))
+			fixedStandardCoinbase = append(fixedStandardCoinbase, coinb1Bytes...)
+			fixedStandardCoinbase = append(fixedStandardCoinbase, standardExtranonce...)
+			fixedStandardCoinbase = append(fixedStandardCoinbase, coinb2Bytes...)
+		}
+		coinbaseAttempts = append(coinbaseAttempts, sv2CoinbaseAttempt{scriptTime: job.ScriptTime, coinb1: coinb1Bytes, coinb2: coinb2Bytes, fixedCoinbase: fixedStandardCoinbase})
+	}
+	if c.isExtended && submitScriptTime > 0 && submitScriptTime != job.ScriptTime {
+		ex2Size := job.Extranonce2Size
+		templateEx2Size := job.TemplateExtraNonce2Size
+		if c.isExtended {
+			downstreamEx2 := int(c.extranonceSize)
+			if downstreamEx2 > 0 {
+				ex2Size = downstreamEx2
+				templateEx2Size = downstreamEx2
+			}
+		}
+		altCoinb1, altCoinb2, altErr := c.buildPayoutCoinbasePartsWithScriptTime(job, ex2Size, templateEx2Size, submitScriptTime)
+		if altErr != nil {
+			logger.Warn("sv2 rebuild coinbase parts", "component", "stratum", "kind", "sv2",
+				"remote", c.id, "error", altErr, "script_time", submitScriptTime)
+		} else {
+			altCoinb1Bytes, altCoinb1Err := hex.DecodeString(altCoinb1)
+			altCoinb2Bytes, altCoinb2Err := hex.DecodeString(altCoinb2)
+			if altCoinb1Err != nil || altCoinb2Err != nil {
+				logger.Warn("sv2 decode rebuilt coinbase parts", "component", "stratum", "kind", "sv2",
+					"remote", c.id, "coinb1_err", altCoinb1Err, "coinb2_err", altCoinb2Err,
+					"script_time", submitScriptTime)
+			} else {
+				coinbaseAttempts = append(coinbaseAttempts, sv2CoinbaseAttempt{scriptTime: submitScriptTime, coinb1: altCoinb1Bytes, coinb2: altCoinb2Bytes})
+			}
+		}
+	}
+
+	for _, coinbaseAttempt := range coinbaseAttempts {
+		for _, variant := range variants {
+			cb := make([]byte, 0, len(coinbaseAttempt.coinb1)+len(variant.en1)+len(variant.en2)+len(coinbaseAttempt.coinb2))
+			if !c.isExtended && len(coinbaseAttempt.fixedCoinbase) > 0 {
+				cb = append(cb, coinbaseAttempt.fixedCoinbase...)
+			} else {
+				cb = append(cb, coinbaseAttempt.coinb1...)
+				cb = append(cb, variant.en1...)
+				cb = append(cb, variant.en2...)
+				cb = append(cb, coinbaseAttempt.coinb2...)
+			}
+			coinbaseTxID, txidErr := txidFromSerializedTx(cb)
+			if txidErr != nil {
+				logger.Warn("sv2 parse coinbase txid", "component", "stratum", "kind", "sv2",
+					"remote", c.id, "error", txidErr, "variant", variant.name)
+				continue
+			}
+			merkleTrace, merkleOK := buildSV2MerkleTrace(coinbaseTxID[:], job.MerkleBranches)
+			if !merkleOK {
+				continue
+			}
+			merkleRootWireLE, merkleErr := hex.DecodeString(merkleTrace.MerkleRootWireLE)
+			if merkleErr != nil || len(merkleRootWireLE) != 32 {
+				continue
+			}
+			for _, candidateVersion := range versionsToTry {
+				if acceptedShare {
+					break
+				}
+				for _, candidateNTimeHex := range ntimeHexes {
+					if acceptedShare {
+						break
+					}
+					for _, candidateNonceHex := range nonceHexes {
+						if acceptedShare {
+							break
+						}
+						for _, candidatePrevHex := range prevHexes {
+							if acceptedShare {
+								break
+							}
+							for _, candidateBitsHex := range bitsHexes {
+								hdr, headerErr := buildBlockHeaderFromHex(int32(candidateVersion), candidatePrevHex, merkleRootWireLE, candidateNTimeHex, candidateBitsHex, candidateNonceHex)
+								if headerErr != nil {
+									logger.Warn("sv2 build block header", "component", "stratum", "kind", "sv2",
+										"remote", c.id, "error", headerErr, "variant", variant.name,
+										"ntime_hex", candidateNTimeHex, "nonce_hex", candidateNonceHex,
+										"prev_hex", candidatePrevHex, "bits_hex", candidateBitsHex)
+									continue
+								}
+								candidateHashRaw := doubleSHA256(hdr)
+								var candidateHashLE [32]byte
+								copy(candidateHashLE[:], candidateHashRaw)
+								reverseBytes32(&candidateHashLE)
+								candidateDiff := difficultyFromHash(candidateHashRaw)
+								if candidateDiff > maxTriedDiff {
+									maxTriedDiff = candidateDiff
+									maxTriedMode = variant.name
+									maxTriedHash = hex.EncodeToString(candidateHashLE[:])
+								}
+								candidateIsBlock := hasNetworkTarget && uint256BELessOrEqual(candidateHashLE, networkTargetBE)
+								meetsShareTarget := uint256BELessOrEqual(candidateHashLE, shareTargetBE)
+								networkTargetCompareHex := ""
+								if hasNetworkTarget {
+									networkTargetCompareHex = hex.EncodeToString(networkTargetBE[:])
+								}
+								logger.Debug("sv2 candidate evaluation", "component", "stratum", "kind", "sv2_candidate_eval",
+									"remote", c.id, "worker", c.workerName,
+									"channel_id", submit.ChannelID, "seq", submit.SequenceNumber, "job_id", submit.JobID,
+									"sv2_trace", func() string {
+										tCtx := c.newSV2SubmitTraceCtx(submit, info)
+										tCtx.Ver = fmt.Sprintf("%08x", candidateVersion)
+										tCtx.NTime = candidateNTimeHex
+										tCtx.Nonce = candidateNonceHex
+										tCtx.NBits = candidateBitsHex
+										tCtx.Prev = candidatePrevHex
+										tCtx.ExN = hex.EncodeToString(append(append([]byte(nil), variant.en1...), variant.en2...))
+										tCtx.ExNLen = fmt.Sprintf("%d", len(variant.en1)+len(variant.en2))
+										tCtx.CoinbaseTxID = merkleTrace.CoinbaseTxIDDisplayBE
+										tCtx.Merkle = merkleTrace.MerkleRootDisplayBE
+										tCtx.Hdr80 = hex.EncodeToString(hdr)
+										tCtx.Hash = hex.EncodeToString(candidateHashLE[:])
+										tCtx.SDiff = sv2FormatFloat(candidateDiff)
+										tCtx.TDiff = sv2FormatFloat(assignedDiff)
+										tCtx.NDiff = "-"
+										tCtx.ShareTarget = hex.EncodeToString(shareTargetBE[:])
+										tCtx.NetTarget = networkTargetCompareHex
+										tCtx.Result = "-"
+										tCtx.Reason = "-"
+										tCtx.Mode = variant.name
+										tCtx.JobType = info.jobType
+										return BuildSV2Trace(tCtx)
+									}(),
+									"seq_job_id", submit.JobID, "template_job_id", job.JobID,
+									"extranonce_hex", hex.EncodeToString(extranonce), "extranonce_len", len(extranonce),
+									"extranonce_prefix_hex", hex.EncodeToString(variant.en1),
+									"extranonce_tail_hex", hex.EncodeToString(variant.en2),
+									"canonical_extranonce_full_hex", hex.EncodeToString(append(append([]byte(nil), variant.en1...), variant.en2...)),
+									"mode", variant.name,
+									"version", fmt.Sprintf("%08x", candidateVersion),
+									"ntime", candidateNTimeHex,
+									"nonce", candidateNonceHex,
+									"nbits", candidateBitsHex,
+									"prevhash_be", candidatePrevHex,
+									"coinbase_prefix_hex", hex.EncodeToString(coinbaseAttempt.coinb1),
+									"coinbase_suffix_hex", hex.EncodeToString(coinbaseAttempt.coinb2),
+									"full_coinbase_hex", hex.EncodeToString(cb),
+									"coinbase_txid_display_be", merkleTrace.CoinbaseTxIDDisplayBE,
+									"coinbase_txid_wire_le", merkleTrace.CoinbaseTxIDWireLE,
+									"merkle_branches_hex", merkleTrace.MerkleBranchesHex,
+									"merkle_layer_hashes_wire_le", merkleTrace.MerkleLayerHashesWireLE,
+									"merkle_layer_hashes_be", merkleTrace.MerkleLayerHashesBE,
+									"merkle_root_wire_le", merkleTrace.MerkleRootWireLE,
+									"merkle_root_display_be", merkleTrace.MerkleRootDisplayBE,
+									"full_header80_hex", hex.EncodeToString(hdr),
+									"hash", hex.EncodeToString(candidateHashLE[:]),
+									"double_sha256_header_be", hex.EncodeToString(candidateHashLE[:]),
+									"double_sha256_header_le", hex.EncodeToString(candidateHashRaw),
+									"double_sha256_header_display_be", hex.EncodeToString(candidateHashLE[:]),
+									"double_sha256_header_wire_le", hex.EncodeToString(candidateHashRaw),
+									"header_hash_display_be", hex.EncodeToString(candidateHashLE[:]),
+									"header_hash_wire_le", hex.EncodeToString(candidateHashRaw),
+									"header_hash_compare_be", hex.EncodeToString(candidateHashLE[:]),
+									"comparison_basis", "be",
+									"share_compare_hash_uint256_be", hex.EncodeToString(candidateHashLE[:]),
+									"share_compare_target_uint256_be", hex.EncodeToString(shareTargetBE[:]),
+									"network_compare_hash_uint256_be", hex.EncodeToString(candidateHashLE[:]),
+									"network_compare_target_uint256_be", networkTargetCompareHex,
+									"share_target_result", meetsShareTarget,
+									"network_target_result", candidateIsBlock,
+								)
+								hdrHex := hex.EncodeToString(hdr)
+								candidateDescriptor := fmt.Sprintf("%s|v=%08x|nt=%s|nn=%s|bits=%s|prev=%s", variant.name, candidateVersion, candidateNTimeHex, candidateNonceHex, candidateBitsHex, candidatePrevHex)
+								candidateHeaderModes[hdrHex] = append(candidateHeaderModes[hdrHex], candidateDescriptor)
+								isCanonicalMode := sv2ModeIsCanonicalAuthoritative(variant.name, hdrHex, candidateHeaderModes)
+								isExperimentalMode := !isCanonicalMode
+										allowExperimentalMode := false && isExperimentalMode
+								shareAuthoritative := isCanonicalMode
+								blockAuthoritative := isCanonicalMode || allowExperimentalMode
+								allowAuthoritativeMode := shareAuthoritative || blockAuthoritative
+								if (candidateIsBlock || meetsShareTarget) && !allowAuthoritativeMode {
+									logger.Warn("sv2 candidate mode excluded from authoritative selection", "component", "stratum", "kind", "sv2_candidate_mode_excluded",
+										"remote", c.id, "worker", c.workerName,
+										"channel_id", submit.ChannelID, "seq", submit.SequenceNumber, "job_id", submit.JobID,
+										"mode", variant.name,
+										"share_target_result", meetsShareTarget,
+										"network_target_result", candidateIsBlock,
+												"experimental_enabled", false,
+										"reason", "canonical-only authoritative selection")
+								}
+								if candidateIsBlock && isExperimentalMode {
+									logger.Warn("sv2 non-canonical network-target diagnostic", "component", "stratum", "kind", "sv2_noncanonical_network_target",
+										"remote", c.id, "worker", c.workerName,
+										"channel_id", submit.ChannelID, "seq", submit.SequenceNumber, "job_id", submit.JobID,
+										"mode", variant.name,
+												"experimental_enabled", false,
+										"accepted_without_submitblock", false)
+								}
+								if candidateIsBlock && !meetsShareTarget {
+									logger.Warn("sv2 candidate network-target-only", "component", "stratum", "kind", "sv2_candidate_network_only",
+										"remote", c.id, "worker", c.workerName,
+										"channel_id", submit.ChannelID, "seq", submit.SequenceNumber, "job_id", submit.JobID,
+										"mode", variant.name,
+										"full_header80_hex", hex.EncodeToString(hdr),
+										"double_sha256_header_display_be", hex.EncodeToString(candidateHashLE[:]),
+										"double_sha256_header_wire_le", hex.EncodeToString(candidateHashRaw),
+										"reason", "not selected by network target alone")
+								}
+								if (meetsShareTarget && shareAuthoritative) || (candidateIsBlock && blockAuthoritative) {
+									var buf bytes.Buffer
+									buf.Write(hdr)
+									writeVarInt(&buf, uint64(1+len(job.Transactions)))
+									buf.Write(cb)
+									submitTxIDs := make([][32]byte, 0, 1+len(job.Transactions))
+									coinbaseTxIDArr, txidErr := txidFromSerializedTx(cb)
+									if txidErr != nil {
+										logger.Warn("sv2 parse submit coinbase txid", "component", "stratum", "kind", "sv2",
+											"remote", c.id, "error", txidErr)
+										continue
+									}
+									submitTxIDs = append(submitTxIDs, coinbaseTxIDArr)
+									submitTxIDsWire := make([]string, 0, 1+len(job.Transactions))
+									submitTxIDsWire = append(submitTxIDsWire, hex.EncodeToString(coinbaseTxIDArr[:]))
+									txBuildOk := true
+									for _, tx := range job.Transactions {
+										txRaw, txErr := hex.DecodeString(tx.Data)
+										if txErr != nil {
+											logger.Warn("sv2 decode tx data", "component", "stratum", "kind", "sv2",
+												"remote", c.id, "error", txErr)
+											txBuildOk = false
+											break
+										}
+										buf.Write(txRaw)
+										txid, txidErr := txidFromSerializedTx(txRaw)
+										if txidErr != nil {
+											logger.Warn("sv2 parse txid from tx data", "component", "stratum", "kind", "sv2",
+												"remote", c.id, "error", txidErr)
+											txBuildOk = false
+											break
+										}
+										submitTxIDs = append(submitTxIDs, txid)
+										submitTxIDsWire = append(submitTxIDsWire, hex.EncodeToString(txid[:]))
+									}
+									if !txBuildOk {
+										continue
+									}
+									recomputedMerkle, merkleOK := sv2ComputeMerkleRootFromTxIDs(submitTxIDs)
+									if !merkleOK {
+										continue
+									}
+									blockHex = hex.EncodeToString(buf.Bytes())
+									headerHashLE = candidateHashLE
+									headerHashRaw = [32]byte{}
+									copy(headerHashRaw[:], candidateHashRaw)
+									hashHex = hex.EncodeToString(headerHashLE[:])
+									selectedVer = candidateVersion
+									selectedMode = variant.name
+									selectedDiff = candidateDiff
+									selectedSTime = coinbaseAttempt.scriptTime
+									selectedNTime = candidateNTimeHex
+									selectedNonce = candidateNonceHex
+									selectedPrev = candidatePrevHex
+									selectedBits = candidateBitsHex
+									selectedMerkleRootWireLE = merkleTrace.MerkleRootWireLE
+									selectedMerkleRootDisplayBE = merkleTrace.MerkleRootDisplayBE
+									selectedHeaderHex = hex.EncodeToString(hdr)
+									selectedCoinbasePrefixHex = hex.EncodeToString(coinbaseAttempt.coinb1)
+									selectedCoinbaseSuffixHex = hex.EncodeToString(coinbaseAttempt.coinb2)
+									selectedFullCoinbaseHex = hex.EncodeToString(cb)
+									selectedCoinbaseTxIDDisplayBE = merkleTrace.CoinbaseTxIDDisplayBE
+									selectedCoinbaseTxIDLE = merkleTrace.CoinbaseTxIDWireLE
+									selectedMerkleLayersWireLE = append([]string(nil), merkleTrace.MerkleLayerHashesWireLE...)
+									selectedMerkleLayersBE = append([]string(nil), merkleTrace.MerkleLayerHashesBE...)
+									selectedBranches = append([]string(nil), merkleTrace.MerkleBranchesHex...)
+									selectedEn2 = append([]byte(nil), variant.en2...)
+									selectedModeExperimental = isExperimentalMode
+									selectedSubmitCoinbaseTxIDWireLE = hex.EncodeToString(coinbaseTxIDArr[:])
+									selectedSubmitMerkleRootWireLE = hex.EncodeToString(recomputedMerkle[:])
+									selectedHeaderMerkleRootWireLE = hex.EncodeToString(hdr[36:68])
+									selectedSubmitTxIDsWireLE = append([]string(nil), submitTxIDsWire...)
+									selectedSubmitTxCount = len(submitTxIDsWire)
+									selectedSubmitMerkleMatchesHeader = bytes.Equal(recomputedMerkle[:], hdr[36:68])
+									acceptedShare = true
+									break
+								}
+								if hashHex == "" {
+									headerHashLE = candidateHashLE
+									headerHashRaw = [32]byte{}
+									copy(headerHashRaw[:], candidateHashRaw)
+									hashHex = hex.EncodeToString(headerHashLE[:])
+									selectedVer = candidateVersion
+									selectedMode = variant.name
+									selectedDiff = candidateDiff
+									selectedSTime = coinbaseAttempt.scriptTime
+									selectedNTime = candidateNTimeHex
+									selectedNonce = candidateNonceHex
+									selectedPrev = candidatePrevHex
+									selectedBits = candidateBitsHex
+									selectedMerkleRootWireLE = merkleTrace.MerkleRootWireLE
+									selectedMerkleRootDisplayBE = merkleTrace.MerkleRootDisplayBE
+									selectedHeaderHex = hex.EncodeToString(hdr)
+									selectedCoinbasePrefixHex = hex.EncodeToString(coinbaseAttempt.coinb1)
+									selectedCoinbaseSuffixHex = hex.EncodeToString(coinbaseAttempt.coinb2)
+									selectedFullCoinbaseHex = hex.EncodeToString(cb)
+									selectedCoinbaseTxIDDisplayBE = merkleTrace.CoinbaseTxIDDisplayBE
+									selectedCoinbaseTxIDLE = merkleTrace.CoinbaseTxIDWireLE
+									selectedMerkleLayersWireLE = append([]string(nil), merkleTrace.MerkleLayerHashesWireLE...)
+									selectedMerkleLayersBE = append([]string(nil), merkleTrace.MerkleLayerHashesBE...)
+									selectedBranches = append([]string(nil), merkleTrace.MerkleBranchesHex...)
+									selectedEn2 = append([]byte(nil), variant.en2...)
+									selectedModeExperimental = isExperimentalMode
+								}
+							}
+							if acceptedShare {
+								break
+							}
+						}
+					}
+				}
+			}
+			if acceptedShare {
+				break
+			}
+		}
+		if acceptedShare {
+			break
+		}
+	}
+	if len(candidateHeaderModes) > 1 {
+		headers := make([]string, 0, len(candidateHeaderModes))
+		modesByHeader := make(map[string][]string, len(candidateHeaderModes))
+		for hdrHex, modes := range candidateHeaderModes {
+			headers = append(headers, hdrHex)
+			modesByHeader[hdrHex] = append([]string(nil), modes...)
+		}
+		headerDiffs := make(map[string][]int)
+		for _, hdrHex := range headers {
+			if selectedHeaderHex != "" && hdrHex != selectedHeaderHex {
+				headerDiffs[hdrHex] = diffHeaderHexByteOffsets(selectedHeaderHex, hdrHex, 24)
+			}
+		}
+		logger.Warn("sv2 reconstruction mode header mismatch", "component", "stratum", "kind", "sv2_reconstruction_header_mismatch",
+			"remote", c.id, "worker", c.workerName,
+			"channel_id", submit.ChannelID, "seq", submit.SequenceNumber, "job_id", submit.JobID,
+			"unique_header_count", len(candidateHeaderModes),
+			"selected_mode", selectedMode,
+			"selected_header80_hex", selectedHeaderHex,
+			"modes_by_header", modesByHeader,
+			"header_diff_offsets_vs_selected", headerDiffs)
+	}
+	computedShareDiff := 0.0
+	meetsShareTarget := false
+	if headerHashRaw != ([32]byte{}) {
+		vm := computeShareValidationMath(headerHashLE, shareThreshold)
+		shareTargetBE = vm.ShareTargetBE
+		meetsShareTarget = vm.MeetsShareTarget
+		computedShareDiff = vm.ComputedShareDiffBDiff
+	}
+	meetsNetworkTarget := hasNetworkTarget && headerHashLE != ([32]byte{}) && uint256BELessOrEqual(headerHashLE, networkTargetBE)
+	networkDiffBDiff := 0.0
+	if bitsHexForDiff := selectedBits; bitsHexForDiff != "" {
+		if nbitsU32, err := parseUint32BEHexPadded(bitsHexForDiff); err == nil {
+			networkDiffBDiff = difficultyFromBits(nbitsU32)
+		}
+	} else if nbitsU32, err := parseUint32BEHexPadded(job.Template.Bits); err == nil {
+		networkDiffBDiff = difficultyFromBits(nbitsU32)
+	}
+	selectedVersionHex := fmt.Sprintf("%08x", selectedVer)
+	if selectedVer == 0 {
+		selectedVersionHex = fmt.Sprintf("%08x", submit.Version)
+	}
+	selectedNTimeHex := selectedNTime
+	if selectedNTimeHex == "" {
+		selectedNTimeHex = fmt.Sprintf("%08x", submit.NTime)
+	}
+	selectedNonceHex := selectedNonce
+	if selectedNonceHex == "" {
+		selectedNonceHex = fmt.Sprintf("%08x", submit.Nonce)
+	}
+	selectedPrevHex := selectedPrev
+	if selectedPrevHex == "" {
+		selectedPrevHex = job.Template.Previous
+	}
+	selectedBitsHex := selectedBits
+	if selectedBitsHex == "" {
+		selectedBitsHex = job.Template.Bits
+	}
+	networkTargetHex := ""
+	if hasNetworkTarget {
+		networkTargetHex = hex.EncodeToString(networkTargetBE[:])
+	}
+	activeTargetBeforeSubmit := c.activeTarget
+	activeTargetAtSubmit := c.activeTarget
+	logger.Debug("sv2 reconstruction trace", "component", "stratum", "kind", "sv2_reconstruction_trace",
+		"sv2_trace", func() string {
+			tCtx := c.newSV2SubmitTraceCtx(submit, info)
+			tCtx.Ver = selectedVersionHex
+			tCtx.NTime = selectedNTimeHex
+			tCtx.Nonce = selectedNonceHex
+			tCtx.NBits = selectedBitsHex
+			tCtx.Prev = selectedPrevHex
+			tCtx.ExN = hex.EncodeToString(standardExtranonce)
+			tCtx.ExNLen = fmt.Sprintf("%d", len(standardExtranonce))
+			tCtx.CoinbaseTxID = selectedCoinbaseTxIDDisplayBE
+			tCtx.Merkle = selectedMerkleRootDisplayBE
+			tCtx.Hdr80 = selectedHeaderHex
+			tCtx.Hash = hashHex
+			tCtx.SDiff = sv2FormatFloat(computedShareDiff)
+			tCtx.TDiff = sv2FormatFloat(shareThreshold)
+			tCtx.NDiff = sv2FormatFloat(networkDiffBDiff)
+			tCtx.ShareTarget = hex.EncodeToString(shareTargetBE[:])
+			tCtx.NetTarget = networkTargetHex
+			tCtx.Result = "-"
+			tCtx.Reason = "-"
+			tCtx.Mode = selectedMode
+			tCtx.JobType = info.jobType
+			return BuildSV2Trace(tCtx)
+		}(),
+		"seq_job_id", submit.JobID,
+		"template_job_id", job.JobID,
+		"channel_id", submit.ChannelID,
+		"channel_type", info.channelType,
+		"job_type", info.jobType,
+		"validation_mode", selectedMode,
+		"seq", submit.SequenceNumber,
+		"extranonce_hex", hex.EncodeToString(extranonce),
+		"extranonce_len", len(extranonce),
+		"version", selectedVersionHex,
+		"ntime", selectedNTimeHex,
+		"nonce", selectedNonceHex,
+		"prevhash_be", selectedPrevHex,
+		"nbits", selectedBitsHex,
+		"selected_mode", selectedMode,
+		"coinbase_prefix_hex", selectedCoinbasePrefixHex,
+		"coinbase_suffix_hex", selectedCoinbaseSuffixHex,
+		"full_coinbase_hex", selectedFullCoinbaseHex,
+		"coinbase_txid_display_be", selectedCoinbaseTxIDDisplayBE,
+		"coinbase_txid_wire_le", selectedCoinbaseTxIDLE,
+		"merkle_branches_hex", selectedBranches,
+		"merkle_layer_hashes_wire_le", selectedMerkleLayersWireLE,
+		"merkle_layer_hashes_be", selectedMerkleLayersBE,
+		"merkle_root_wire_le", selectedMerkleRootWireLE,
+		"merkle_root_display_be", selectedMerkleRootDisplayBE,
+		"full_header80_hex", selectedHeaderHex,
+		"double_sha256_header_be", hashHex,
+		"double_sha256_header_le", hex.EncodeToString(headerHashRaw[:]),
+		"double_sha256_header_display_be", hashHex,
+		"double_sha256_header_wire_le", hex.EncodeToString(headerHashRaw[:]),
+		"selected_mode_experimental", selectedModeExperimental,
+	)
+	if len(minerHeader80) == 80 {
+		espHeaderHex := hex.EncodeToString(minerHeader80)
+		diffOffsets := diffHeaderHexByteOffsets(selectedHeaderHex, espHeaderHex, 80)
+		merkleOnlyMismatch := sv2DiffIsMerkleRootOnly(diffOffsets)
+		espHashRaw := doubleSHA256(minerHeader80)
+		var espHashBE [32]byte
+		copy(espHashBE[:], espHashRaw)
+		reverseBytes32(&espHashBE)
+		espHashHex := hex.EncodeToString(espHashBE[:])
+		reconstructedHashHex := hex.EncodeToString(headerHashLE[:])
+		espHashMatches := espHashHex == reconstructedHashHex
+		espMeetsShare := uint256BELessOrEqual(espHashBE, shareTargetBE)
+		reconstructedMeetsShare := uint256BELessOrEqual(headerHashLE, shareTargetBE)
+		logger.Debug("sv2 header parity", "component", "stratum", "kind", "sv2_header_parity",
+			"remote", c.id, "worker", c.workerName,
+			"channel_id", submit.ChannelID, "seq", submit.SequenceNumber, "job_id", submit.JobID,
+			"selected_mode", selectedMode,
+			"esp_header80_hex", espHeaderHex,
+			"full_header80_hex", selectedHeaderHex,
+			"header_match", selectedHeaderHex == espHeaderHex,
+			"header_diff_offsets", diffOffsets,
+			"header_diff_count", len(diffOffsets),
+			"merkle_root_only_mismatch", merkleOnlyMismatch,
+			"merkle_root_field_offsets", "36..67",
+			"diagnostic_hint", "if only 36..67 differ, issue is coinbase/merkle root reconstruction")
+		if info.channelType == sv2ChannelTypeStandard {
+			logger.Debug("sv2 standard parity", "component", "stratum", "kind", "sv2_standard_parity",
+				"remote", c.id, "worker", c.workerName,
+				"channel_type", info.channelType,
+				"job_id", submit.JobID,
+				"seq_job_id", submit.JobID,
+				"template_job_id", job.JobID,
+				"seq", submit.SequenceNumber,
+				"version", fmt.Sprintf("%08x", submit.Version),
+				"ntime", fmt.Sprintf("%08x", submit.NTime),
+				"nonce", fmt.Sprintf("%08x", submit.Nonce),
+				"esp_header80_hex", espHeaderHex,
+				"reconstructed_header80_hex", selectedHeaderHex,
+				"byte_diff_offsets", diffOffsets,
+				"merkle_only_36_67", merkleOnlyMismatch,
+				"esp_hash_be", espHashHex,
+				"reconstructed_hash_be", reconstructedHashHex,
+				"esp_hash_matches_reconstructed", espHashMatches,
+				"esp_meets_share_target", espMeetsShare,
+				"reconstructed_meets_share_target", reconstructedMeetsShare)
+			if !espHashMatches {
+				reason := sv2ClassifyHeaderMismatch(diffOffsets)
+				logger.Warn("sv2 standard header mismatch", "component", "stratum", "kind", "sv2_standard_header_mismatch",
+					"remote", c.id, "worker", c.workerName,
+					"channel_id", submit.ChannelID, "seq", submit.SequenceNumber, "job_id", submit.JobID,
+					"sv2_trace", func() string {
+						tCtx := c.newSV2SubmitTraceCtx(submit, info)
+						tCtx.Ver = selectedVersionHex
+						tCtx.NTime = selectedNTimeHex
+						tCtx.Nonce = selectedNonceHex
+						tCtx.NBits = selectedBitsHex
+						tCtx.Prev = selectedPrevHex
+						tCtx.ExN = hex.EncodeToString(standardExtranonce)
+						tCtx.ExNLen = fmt.Sprintf("%d", len(standardExtranonce))
+						tCtx.CoinbaseTxID = selectedCoinbaseTxIDDisplayBE
+						tCtx.Merkle = selectedMerkleRootDisplayBE
+						tCtx.Hdr80 = selectedHeaderHex
+						tCtx.Hash = hashHex
+						tCtx.Result = "rejected"
+						tCtx.Reason = reason
+						tCtx.Mode = selectedMode
+						tCtx.JobType = info.jobType
+						return BuildSV2Trace(tCtx)
+					}(),
+					"reason", reason,
+					"esp_header80_hex", espHeaderHex,
+					"reconstructed_header80_hex", selectedHeaderHex,
+					"byte_diff_offsets", diffOffsets,
+					"merkle_only_36_67", merkleOnlyMismatch)
+				c.recordShare(c.workerName, false, 0, selectedDiff, reason, hashHex, now)
+				c.sendShareError(submit.ChannelID, submit.SequenceNumber, reason)
+				return
+			}
+		}
+	}
+	logger.Debug("share validation",
+		"component", "stratum",
+		"kind", "sv2",
+		"sv2_trace", func() string {
+			tCtx := c.newSV2SubmitTraceCtx(submit, info)
+			tCtx.Ver = selectedVersionHex
+			tCtx.NTime = selectedNTimeHex
+			tCtx.Nonce = selectedNonceHex
+			tCtx.NBits = selectedBitsHex
+			tCtx.Prev = selectedPrevHex
+			tCtx.ExN = hex.EncodeToString(standardExtranonce)
+			tCtx.ExNLen = fmt.Sprintf("%d", len(standardExtranonce))
+			tCtx.CoinbaseTxID = selectedCoinbaseTxIDDisplayBE
+			tCtx.Merkle = selectedMerkleRootDisplayBE
+			tCtx.Hdr80 = selectedHeaderHex
+			tCtx.Hash = hashHex
+			tCtx.SDiff = sv2FormatFloat(computedShareDiff)
+			tCtx.TDiff = sv2FormatFloat(shareThreshold)
+			tCtx.NDiff = sv2FormatFloat(networkDiffBDiff)
+			tCtx.ShareTarget = hex.EncodeToString(shareTargetBE[:])
+			tCtx.NetTarget = networkTargetHex
+			tCtx.Result = "-"
+			tCtx.Reason = "-"
+			tCtx.Mode = selectedMode
+			tCtx.JobType = info.jobType
+			return BuildSV2Trace(tCtx)
+		}(),
+		"channel_type", info.channelType,
+		"job_type", info.jobType,
+		"validation_mode", selectedMode,
+		"connection_worker", c.workerName,
+		"submit_worker", c.workerName,
+		"job_id", submit.JobID,
+		"header_hash_display_be", hashHex,
+		"header_hash_wire_le", hex.EncodeToString(headerHashRaw[:]),
+		"header_hash_compare_be", hex.EncodeToString(headerHashLE[:]),
+		"full_header80_hex", selectedHeaderHex,
+		"double_sha256_header_be", hashHex,
+		"double_sha256_header_le", hex.EncodeToString(headerHashRaw[:]),
+		"double_sha256_header_display_be", hashHex,
+		"double_sha256_header_wire_le", hex.EncodeToString(headerHashRaw[:]),
+		"header_hex", selectedHeaderHex,
+		"selected_mode_experimental", selectedModeExperimental,
+		"coinbase_txid_display_be", selectedCoinbaseTxIDDisplayBE,
+		"coinbase_txid_wire_le", selectedCoinbaseTxIDLE,
+		"merkle_root_wire_le", selectedMerkleRootWireLE,
+		"merkle_root_display_be", selectedMerkleRootDisplayBE,
+		"share_target_be", hex.EncodeToString(shareTargetBE[:]),
+		"network_target_be", networkTargetHex,
+		"comparison_basis", "be",
+		"share_compare_hash_uint256_be", hex.EncodeToString(headerHashLE[:]),
+		"share_compare_target_uint256_be", hex.EncodeToString(shareTargetBE[:]),
+		"network_compare_hash_uint256_be", hex.EncodeToString(headerHashLE[:]),
+		"network_compare_target_uint256_be", networkTargetHex,
+		"assigned_share_diff_bdiff", shareThreshold,
+		"uncapped_requested_share_diff_bdiff", uncappedRequestedDiff,
+		"computed_share_diff_bdiff", computedShareDiff,
+		"network_diff_bdiff", networkDiffBDiff,
+		"meets_share_target", meetsShareTarget,
+		"meets_network_target", meetsNetworkTarget,
+		"share_compare", "header_hash <= share_target",
+		"network_compare", "header_hash <= network_target",
+		"is_block", meetsNetworkTarget,
+		"version", selectedVersionHex,
+		"ntime", selectedNTimeHex,
+		"nonce", selectedNonceHex,
+		"nbits", selectedBitsHex,
+		"prevhash_be", selectedPrevHex,
+		"merkle_root_wire_le", selectedMerkleRootWireLE,
+		"merkle_root_display_be", selectedMerkleRootDisplayBE,
+		"channel_id", submit.ChannelID,
+		"seq", submit.SequenceNumber,
+		"extranonce_hex", hex.EncodeToString(extranonce),
+		"extranonce_len", len(extranonce),
+		"canonical_inserted_extranonce_hex", hex.EncodeToString(standardExtranonce),
+		"canonical_inserted_extranonce_len", len(standardExtranonce),
+		"active_channel_target_before_submit", hex.EncodeToString(activeTargetBeforeSubmit[:]),
+		"active_channel_target_at_submit", hex.EncodeToString(activeTargetAtSubmit[:]),
+		"template_job_id", job.JobID,
+		"seq_job_id", submit.JobID,
+		"selected_mode", selectedMode,
+		"selected_mode_experimental", selectedModeExperimental,
+	)
+	if (debugLogging || verboseRuntimeLogging) && computedShareDiff > 0 {
+		delta := math.Abs(computedShareDiff - selectedDiff)
+		if delta/computedShareDiff > 1e-3 {
+			logger.Warn("difficulty consistency mismatch", "component", "stratum", "kind", "sv2", "job_id", submit.JobID,
+				"computed_share_diff_bdiff", computedShareDiff,
+				"legacy_share_diff_value", selectedDiff,
+				"delta", delta)
+		}
+	}
+	if shareValidationDebugEnabled() {
+		validationResult := "accepted"
+		rejectReason := ""
+		if !acceptedShare {
+			validationResult = "rejected"
+			rejectReason = "low-difficulty"
+		}
+		logger.Debug("share validation debug",
+			"component", "stratum",
+			"kind", "sv2",
+			"stratum_version", "sv2",
+			"connection_id", c.id,
+			"remote", c.id,
+			"worker_name", c.workerName,
+			"channel_id", submit.ChannelID,
+			"job_id", submit.JobID,
+			"sequence_number", submit.SequenceNumber,
+			"nonce", selectedNonceHex,
+			"ntime", selectedNTimeHex,
+			"version", selectedVersionHex,
+			"extranonce", hex.EncodeToString(standardExtranonce),
+			"extranonce2", hex.EncodeToString(selectedEn2),
+			"prevhash", selectedPrevHex,
+			"merkle_root", selectedMerkleRootDisplayBE,
+			"nbits", selectedBitsHex,
+			"header80_hex", selectedHeaderHex,
+			"hash_hex", hashHex,
+			"hash_interpreted_integer_hex", hex.EncodeToString(headerHashLE[:]),
+			"assigned_target_hex", hex.EncodeToString(shareTargetBE[:]),
+			"required_difficulty", shareThreshold,
+			"computed_share_difficulty", computedShareDiff,
+			"validation_result", validationResult,
+			"reject_reason", rejectReason,
+			"open_nominal_hash_rate", c.openNominalHashrate,
+			"open_max_target", func() string {
+				if c.hasMinerMaxTarget {
+					return hex.EncodeToString(c.minerMaxTarget[:])
+				}
+				return ""
+			}(),
+			"open_success_target", hex.EncodeToString(c.activeTarget[:]),
+			"active_channel_target_before_submit", hex.EncodeToString(activeTargetBeforeSubmit[:]),
+			"active_channel_target_at_submit", hex.EncodeToString(activeTargetAtSubmit[:]),
+		)
+	}
+	if !acceptedShare {
+		variantNames := make([]string, 0, len(variants))
+		for _, v := range variants {
+			variantNames = append(variantNames, v.name)
+		}
+		altEndianDiff := 0.0
+		if headerHashRaw != ([32]byte{}) {
+			altEndianDiff = difficultyFromHash(headerHashLE[:])
+		}
+		lastDiffChangeAgoMs := int64(-1)
+		if !c.lastDiffChangeSV2.IsZero() {
+			lastDiffChangeAgoMs = now.Sub(c.lastDiffChangeSV2).Milliseconds()
+		}
+		logger.Warn("sv2 share rejected low-difficulty", "component", "stratum", "kind", "sv2_lowdiff_reject",
+			"remote", c.id, "worker", c.workerName,
+			"channel_id", submit.ChannelID, "seq", submit.SequenceNumber, "job_id", submit.JobID,
+			"sv2_trace", func() string {
+				tCtx := c.newSV2SubmitTraceCtx(submit, info)
+				tCtx.Ver = selectedVersionHex
+				tCtx.NTime = selectedNTimeHex
+				tCtx.Nonce = selectedNonceHex
+				tCtx.NBits = selectedBitsHex
+				tCtx.Prev = selectedPrevHex
+				tCtx.ExN = hex.EncodeToString(standardExtranonce)
+				tCtx.ExNLen = fmt.Sprintf("%d", len(standardExtranonce))
+				tCtx.CoinbaseTxID = selectedCoinbaseTxIDDisplayBE
+				tCtx.Merkle = selectedMerkleRootDisplayBE
+				tCtx.Hdr80 = selectedHeaderHex
+				tCtx.Hash = hashHex
+				tCtx.SDiff = sv2FormatFloat(computedShareDiff)
+				tCtx.TDiff = sv2FormatFloat(shareThreshold)
+				tCtx.NDiff = sv2FormatFloat(networkDiffBDiff)
+				tCtx.ShareTarget = hex.EncodeToString(shareTargetBE[:])
+				tCtx.NetTarget = networkTargetHex
+				tCtx.Result = "rejected"
+				tCtx.Reason = "low-difficulty"
+				tCtx.Mode = selectedMode
+				tCtx.JobType = info.jobType
+				return BuildSV2Trace(tCtx)
+			}(),
+			"hash", hashHex,
+			"computed_share_diff_bdiff", selectedDiff, "required_share_diff_bdiff", shareThreshold,
+			"uncapped_requested_share_diff_bdiff", uncappedRequestedDiff,
+			"max_tried_diff", maxTriedDiff, "max_tried_mode", maxTriedMode, "max_tried_hash", maxTriedHash,
+			"alt_endian_diff", altEndianDiff,
+			"assigned_share_diff_bdiff", assignedDiff, "current_share_diff_bdiff", c.difficulty, "prev_share_diff_bdiff", c.previousDifficulty,
+			"last_diff_change_ago_ms", lastDiffChangeAgoMs,
+			"submitted_ntime", submit.NTime, "submitted_nonce", submit.Nonce,
+			"submitted_version", fmt.Sprintf("%08x", submit.Version), "selected_version", fmt.Sprintf("%08x", selectedVer),
+			"selected_mode", selectedMode, "selected_ntime_hex", selectedNTime, "selected_nonce_hex", selectedNonce,
+			"selected_prev_hex", selectedPrev, "selected_bits_hex", selectedBits,
+			"submitted_extranonce_len", len(extranonce), "selected_extranonce2_len", len(selectedEn2),
+			"modes_tried", variantNames)
+		logger.Warn("sv2 low-diff reject diagnostics", "component", "stratum", "kind", "sv2_lowdiff_reject_diag",
+			"remote", c.id, "worker", c.workerName, "hash", hashHex,
+			"submitted_version", fmt.Sprintf("%08x", submit.Version), "selected_version", fmt.Sprintf("%08x", selectedVer),
+			"selected_mode", selectedMode, "submitted_extranonce_len", len(extranonce), "modes_tried", variantNames,
+			"submitted_extranonce_hex", hex.EncodeToString(extranonce), "extranonce1_hex", c.extranonce1Hex,
+			"computed_share_diff_bdiff", selectedDiff, "required_share_diff_bdiff", shareThreshold,
+			"uncapped_requested_share_diff_bdiff", uncappedRequestedDiff,
+			"selected_script_time", selectedSTime, "script_times_tried", scriptTimesToTry,
+			"selected_ntime_hex", selectedNTime, "selected_nonce_hex", selectedNonce,
+			"ntime_hexes_tried", ntimeHexes, "nonce_hexes_tried", nonceHexes,
+			"selected_prev_hex", selectedPrev, "selected_bits_hex", selectedBits,
+			"prev_hexes_tried", prevHexes, "bits_hexes_tried", bitsHexes)
+		logger.Warn("sv2 low-diff reject coinbase", "component", "stratum", "kind", "sv2_lowdiff_reject_coinbase",
+			"remote", c.id, "worker", c.workerName, "hash", hashHex,
+			"coinb1_hex", info.coinb1, "coinb2_len", len(info.coinb2)/2,
+			"extranonce1_hex", c.extranonce1Hex, "extranonce1_len", len(c.extranonce1),
+			"submitted_extranonce_hex", hex.EncodeToString(extranonce), "submitted_extranonce_len", len(extranonce),
+			"modes_tried", variantNames)
+		c.recordShare(c.workerName, false, 0, selectedDiff, "lowDiff", hashHex, now)
+		c.sendShareError(submit.ChannelID, submit.SequenceNumber, "low-difficulty")
+		return
+	}
+
+	if c.isDuplicateShare(submit.JobID, selectedEn2, submit.NTime, submit.Nonce, selectedVer) {
+		logger.Warn("sv2 duplicate share rejected", "component", "stratum", "kind", "sv2_duplicate_reject",
+			"remote", c.id, "worker", c.workerName,
+			"channel_id", submit.ChannelID, "seq", submit.SequenceNumber, "job_id", submit.JobID,
+			"sv2_trace", func() string {
+				tCtx := c.newSV2SubmitTraceCtx(submit, info)
+				tCtx.Ver = selectedVersionHex
+				tCtx.NTime = selectedNTimeHex
+				tCtx.Nonce = selectedNonceHex
+				tCtx.NBits = selectedBitsHex
+				tCtx.Prev = selectedPrevHex
+				tCtx.ExN = hex.EncodeToString(standardExtranonce)
+				tCtx.ExNLen = fmt.Sprintf("%d", len(standardExtranonce))
+				tCtx.CoinbaseTxID = selectedCoinbaseTxIDDisplayBE
+				tCtx.Merkle = selectedMerkleRootDisplayBE
+				tCtx.Hdr80 = selectedHeaderHex
+				tCtx.Hash = hashHex
+				tCtx.Result = "rejected"
+				tCtx.Reason = "duplicate-share"
+				tCtx.Mode = selectedMode
+				tCtx.JobType = info.jobType
+				return BuildSV2Trace(tCtx)
+			}())
+		c.recordShare(c.workerName, false, 0, selectedDiff, "duplicate share", hashHex, now)
+		c.sendShareError(submit.ChannelID, submit.SequenceNumber, "duplicate-share")
+		return
+	}
+
+	isBlock := false
+	if job.Target != nil && job.Target.Sign() > 0 {
+		networkTargetBE := uint256BEFromBigInt(job.Target)
+		isBlock = uint256BELessOrEqual(headerHashLE, networkTargetBE)
+	}
+	logger.Debug("sv2 share accepted", "component", "stratum", "kind", "sv2",
+		"remote", c.id, "worker", c.workerName,
+		"job_id", submit.JobID, "hash", hashHex, "is_block", isBlock, "mode", selectedMode,
+		"sv2_trace", func() string {
+			tCtx := c.newSV2SubmitTraceCtx(submit, info)
+			tCtx.Ver = selectedVersionHex
+			tCtx.NTime = selectedNTimeHex
+			tCtx.Nonce = selectedNonceHex
+			tCtx.NBits = selectedBitsHex
+			tCtx.Prev = selectedPrevHex
+			tCtx.ExN = hex.EncodeToString(standardExtranonce)
+			tCtx.ExNLen = fmt.Sprintf("%d", len(standardExtranonce))
+			tCtx.CoinbaseTxID = selectedCoinbaseTxIDDisplayBE
+			tCtx.Merkle = selectedMerkleRootDisplayBE
+			tCtx.Hdr80 = selectedHeaderHex
+			tCtx.Hash = hashHex
+			tCtx.SDiff = sv2FormatFloat(computedShareDiff)
+			tCtx.TDiff = sv2FormatFloat(shareThreshold)
+			tCtx.NDiff = sv2FormatFloat(networkDiffBDiff)
+			tCtx.ShareTarget = hex.EncodeToString(shareTargetBE[:])
+			tCtx.NetTarget = networkTargetHex
+			if isBlock {
+				tCtx.Result = "block-candidate"
+			} else {
+				tCtx.Result = "accepted"
+			}
+			tCtx.Reason = "-"
+			tCtx.Mode = selectedMode
+			tCtx.JobType = info.jobType
+			return BuildSV2Trace(tCtx)
+		}(),
+		"computed_share_diff_bdiff", selectedDiff, "required_share_diff_bdiff", shareThreshold,
+		"selected_script_time", selectedSTime,
+		"selected_ntime_hex", selectedNTime, "selected_nonce_hex", selectedNonce,
+		"selected_prev_hex", selectedPrev, "selected_bits_hex", selectedBits)
+
+	blockFound := false
+	authoritativeMode := ""
+	if isBlock {
+		logger.Debug("sv2 submitblock assembly", "component", "stratum", "kind", "sv2_submitblock_assembly",
+			"remote", c.id, "worker", c.workerName,
+			"channel_type", info.channelType,
+			"job_type", info.jobType,
+			"selected_mode", selectedMode,
+			"template_job_id", job.JobID,
+			"seq_job_id", submit.JobID,
+			"job_id", submit.JobID,
+			"submit_block_header80_hex", selectedHeaderHex,
+			"submit_block_coinbase_hex", selectedFullCoinbaseHex,
+			"submit_block_coinbase_txid_wire_le", selectedSubmitCoinbaseTxIDWireLE,
+			"submit_block_merkle_root_wire_le", selectedSubmitMerkleRootWireLE,
+			"header_merkle_root_wire_le", selectedHeaderMerkleRootWireLE,
+			"submit_block_tx_count", selectedSubmitTxCount,
+			"submit_block_txids_wire_le", selectedSubmitTxIDsWireLE,
+			"submit_block_recomputed_merkle_matches_header", selectedSubmitMerkleMatchesHeader)
+		if !selectedSubmitMerkleMatchesHeader {
+			logger.Warn("sv2 submitblock assembly mismatch", "component", "stratum", "kind", "sv2_submitblock_assembly_mismatch",
+				"remote", c.id, "worker", c.workerName,
+				"sv2_trace", func() string {
+					tCtx := c.newSV2SubmitTraceCtx(submit, info)
+					tCtx.Ver = selectedVersionHex
+					tCtx.NTime = selectedNTimeHex
+					tCtx.Nonce = selectedNonceHex
+					tCtx.NBits = selectedBitsHex
+					tCtx.Prev = selectedPrevHex
+					tCtx.ExN = hex.EncodeToString(standardExtranonce)
+					tCtx.ExNLen = fmt.Sprintf("%d", len(standardExtranonce))
+					tCtx.CoinbaseTxID = selectedCoinbaseTxIDDisplayBE
+					tCtx.Merkle = selectedMerkleRootDisplayBE
+					tCtx.Hdr80 = selectedHeaderHex
+					tCtx.Hash = hashHex
+					tCtx.Result = "block-rejected"
+					tCtx.Reason = "submitblock-assembly-merkle-mismatch"
+					tCtx.Mode = selectedMode
+					tCtx.JobType = info.jobType
+					return BuildSV2Trace(tCtx)
+				}(),
+				"channel_type", info.channelType,
+				"job_type", info.jobType,
+				"selected_mode", selectedMode,
+				"template_job_id", job.JobID,
+				"seq_job_id", submit.JobID,
+				"submit_block_header80_hex", selectedHeaderHex,
+				"submit_block_coinbase_hex", selectedFullCoinbaseHex,
+				"submit_block_coinbase_txid_wire_le", selectedSubmitCoinbaseTxIDWireLE,
+				"submit_block_merkle_root_wire_le", selectedSubmitMerkleRootWireLE,
+				"header_merkle_root_wire_le", selectedHeaderMerkleRootWireLE,
+				"submit_block_tx_count", selectedSubmitTxCount,
+				"submit_block_txids_wire_le", selectedSubmitTxIDsWireLE,
+				"submit_block_recomputed_merkle_matches_header", false)
+			c.recordShare(c.workerName, false, 0, selectedDiff, "submitblock-assembly-merkle-mismatch", hashHex, now)
+			c.sendShareError(submit.ChannelID, submit.SequenceNumber, "submitblock-assembly-merkle-mismatch")
+			return
+		}
+		preflight, err := preflightSubmitBlockRPC(blockHex)
+		if err != nil {
+			logger.Warn("sv2_submitblock_rpc_preflight_failed", "component", "stratum", "kind", "sv2_submitblock_rpc_preflight_failed",
+				"remote", c.id, "worker", c.workerName,
+				"sv2_trace", func() string {
+					tCtx := c.newSV2SubmitTraceCtx(submit, info)
+					tCtx.Ver = selectedVersionHex
+					tCtx.NTime = selectedNTimeHex
+					tCtx.Nonce = selectedNonceHex
+					tCtx.NBits = selectedBitsHex
+					tCtx.Prev = selectedPrevHex
+					tCtx.ExN = hex.EncodeToString(standardExtranonce)
+					tCtx.ExNLen = fmt.Sprintf("%d", len(standardExtranonce))
+					tCtx.CoinbaseTxID = selectedCoinbaseTxIDDisplayBE
+					tCtx.Merkle = selectedMerkleRootDisplayBE
+					tCtx.Hdr80 = selectedHeaderHex
+					tCtx.Hash = hashHex
+					tCtx.Result = "block-rejected"
+					tCtx.Reason = "submitblock-rpc-preflight-failed"
+					tCtx.Mode = selectedMode
+					tCtx.JobType = info.jobType
+					return BuildSV2Trace(tCtx)
+				}(),
+				"hash", hashHex,
+				"submit_block_rpc_hex", blockHex,
+				"submit_block_rpc_len", len(blockHex),
+				"error", err)
+			c.recordShare(c.workerName, false, 0, selectedDiff, "submitblock-rpc-preflight-failed", hashHex, now)
+			c.sendShareError(submit.ChannelID, submit.SequenceNumber, "submitblock-rpc-preflight-failed")
+			return
+		}
+		logger.Debug("submitblock rpc payload", "component", "stratum", "kind", "submitblock_rpc_payload",
+			"remote", c.id, "worker", c.workerName,
+			"hash", hashHex,
+			"submit_block_rpc_hex", preflight.rpcHex,
+			"submit_block_rpc_len", preflight.rpcLen,
+			"submit_block_rpc_prefix_hex", preflight.rpcPrefixHex,
+			"submit_block_rpc_header80_hex", preflight.rpcHeader80Hex,
+			"submit_block_rpc_tx_count_varint_hex", preflight.rpcTxCountVarintHex,
+			"submit_block_rpc_first_tx_hex", preflight.rpcFirstTxHex,
+			"submit_block_rpc_header_merkle_wire_le", preflight.headerMerkleWireLE,
+			"submit_block_rpc_recomputed_merkle_wire_le", preflight.parsedMerkleWireLE,
+			"submit_block_rpc_tx_count", preflight.parsedTxCount,
+			"submit_block_rpc_txids_wire_le", preflight.parsedTxidsWireLE,
+			"submit_block_rpc_recomputed_merkle_matches_header", preflight.merkleMatchesHeader)
+		if !preflight.merkleMatchesHeader {
+			logger.Warn("sv2_submitblock_rpc_preflight_failed", "component", "stratum", "kind", "sv2_submitblock_rpc_preflight_failed",
+				"remote", c.id, "worker", c.workerName,
+				"sv2_trace", func() string {
+					tCtx := c.newSV2SubmitTraceCtx(submit, info)
+					tCtx.Ver = selectedVersionHex
+					tCtx.NTime = selectedNTimeHex
+					tCtx.Nonce = selectedNonceHex
+					tCtx.NBits = selectedBitsHex
+					tCtx.Prev = selectedPrevHex
+					tCtx.ExN = hex.EncodeToString(standardExtranonce)
+					tCtx.ExNLen = fmt.Sprintf("%d", len(standardExtranonce))
+					tCtx.CoinbaseTxID = selectedCoinbaseTxIDDisplayBE
+					tCtx.Merkle = selectedMerkleRootDisplayBE
+					tCtx.Hdr80 = selectedHeaderHex
+					tCtx.Hash = hashHex
+					tCtx.Result = "block-rejected"
+					tCtx.Reason = "submitblock-rpc-preflight-merkle-mismatch"
+					tCtx.Mode = selectedMode
+					tCtx.JobType = info.jobType
+					return BuildSV2Trace(tCtx)
+				}(),
+				"hash", hashHex,
+				"submit_block_rpc_hex", preflight.rpcHex,
+				"submit_block_rpc_len", preflight.rpcLen,
+				"submit_block_rpc_header80_hex", preflight.rpcHeader80Hex,
+				"submit_block_rpc_tx_count_varint_hex", preflight.rpcTxCountVarintHex,
+				"submit_block_rpc_first_tx_hex", preflight.rpcFirstTxHex,
+				"parsed_tx_count", preflight.parsedTxCount,
+				"parsed_tx_count_offsets", preflight.parsedTxCountOffsets,
+				"parsed_txids_wire_le", preflight.parsedTxidsWireLE,
+				"parsed_tx_offsets", preflight.parsedTxOffsets,
+				"recomputed_merkle_wire_le", preflight.parsedMerkleWireLE,
+				"header_merkle_wire_le", preflight.headerMerkleWireLE,
+				"byte_diff_offsets", preflight.merkleDiffOffsets)
+			c.recordShare(c.workerName, false, 0, selectedDiff, "submitblock-rpc-preflight-merkle-mismatch", hashHex, now)
+			c.sendShareError(submit.ChannelID, submit.SequenceNumber, "submitblock-rpc-preflight-merkle-mismatch")
+			return
+		}
+		rpcBlockHex := preflight.rpcHex
+		var submitRes interface{}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := c.rpc.callCtx(ctx, "submitblock", []any{rpcBlockHex}, &submitRes); err != nil {
+			if c.metrics != nil {
+				c.metrics.RecordBlockSubmission("error")
+			}
+			logger.Error("sv2 block submit failed", "component", "stratum", "kind", "sv2",
+				"remote", c.id, "worker", c.workerName, "hash", hashHex, "error", err)
+		} else if resultErr := submitBlockResultError((*any)(&submitRes)); resultErr != nil {
+			if c.metrics != nil {
+				c.metrics.RecordBlockSubmission("error")
+			}
+			logger.Warn("sv2 block submit rejected", "component", "stratum", "kind", "sv2",
+				"remote", c.id, "worker", c.workerName, "hash", hashHex,
+				"sv2_trace", func() string {
+					tCtx := c.newSV2SubmitTraceCtx(submit, info)
+					tCtx.Ver = selectedVersionHex
+					tCtx.NTime = selectedNTimeHex
+					tCtx.Nonce = selectedNonceHex
+					tCtx.NBits = selectedBitsHex
+					tCtx.Prev = selectedPrevHex
+					tCtx.ExN = hex.EncodeToString(standardExtranonce)
+					tCtx.ExNLen = fmt.Sprintf("%d", len(standardExtranonce))
+					tCtx.CoinbaseTxID = selectedCoinbaseTxIDDisplayBE
+					tCtx.Merkle = selectedMerkleRootDisplayBE
+					tCtx.Hdr80 = selectedHeaderHex
+					tCtx.Hash = hashHex
+					tCtx.SDiff = sv2FormatFloat(computedShareDiff)
+					tCtx.TDiff = sv2FormatFloat(shareThreshold)
+					tCtx.NDiff = sv2FormatFloat(networkDiffBDiff)
+					tCtx.ShareTarget = hex.EncodeToString(shareTargetBE[:])
+					tCtx.NetTarget = networkTargetHex
+					tCtx.Result = "block-rejected"
+					tCtx.Reason = resultErr.Error()
+					tCtx.Mode = selectedMode
+					tCtx.JobType = info.jobType
+					return BuildSV2Trace(tCtx)
+				}(),
+				"result", resultErr.Error())
+		} else {
+			if c.metrics != nil {
+				c.metrics.RecordBlockSubmission("accepted")
+			}
+			c.logFoundBlock(job, c.workerName, hashHex, selectedDiff)
+			logger.Info("sv2 block submit accepted", "component", "stratum", "kind", "sv2",
+				"remote", c.id, "worker", c.workerName, "hash", hashHex,
+				"sv2_trace", func() string {
+					tCtx := c.newSV2SubmitTraceCtx(submit, info)
+					tCtx.Ver = selectedVersionHex
+					tCtx.NTime = selectedNTimeHex
+					tCtx.Nonce = selectedNonceHex
+					tCtx.NBits = selectedBitsHex
+					tCtx.Prev = selectedPrevHex
+					tCtx.ExN = hex.EncodeToString(standardExtranonce)
+					tCtx.ExNLen = fmt.Sprintf("%d", len(standardExtranonce))
+					tCtx.CoinbaseTxID = selectedCoinbaseTxIDDisplayBE
+					tCtx.Merkle = selectedMerkleRootDisplayBE
+					tCtx.Hdr80 = selectedHeaderHex
+					tCtx.Hash = hashHex
+					tCtx.SDiff = sv2FormatFloat(computedShareDiff)
+					tCtx.TDiff = sv2FormatFloat(shareThreshold)
+					tCtx.NDiff = sv2FormatFloat(networkDiffBDiff)
+					tCtx.ShareTarget = hex.EncodeToString(shareTargetBE[:])
+					tCtx.NetTarget = networkTargetHex
+					tCtx.Result = "block-accepted"
+					tCtx.Reason = "-"
+					tCtx.Mode = selectedMode
+					tCtx.JobType = info.jobType
+					return BuildSV2Trace(tCtx)
+				}())
+			blockFound = true
+			authoritativeMode = selectedMode
+		}
+	}
+	if isBlock && !blockFound {
+		logger.Warn("sv2 reconstruction invalid despite network target", "component", "stratum", "kind", "sv2_reconstruction_invalid",
+			"remote", c.id, "worker", c.workerName,
+			"sv2_trace", func() string {
+				tCtx := c.newSV2SubmitTraceCtx(submit, info)
+				tCtx.Ver = selectedVersionHex
+				tCtx.NTime = selectedNTimeHex
+				tCtx.Nonce = selectedNonceHex
+				tCtx.NBits = selectedBitsHex
+				tCtx.Prev = selectedPrevHex
+				tCtx.ExN = hex.EncodeToString(standardExtranonce)
+				tCtx.ExNLen = fmt.Sprintf("%d", len(standardExtranonce))
+				tCtx.CoinbaseTxID = selectedCoinbaseTxIDDisplayBE
+				tCtx.Merkle = selectedMerkleRootDisplayBE
+				tCtx.Hdr80 = selectedHeaderHex
+				tCtx.Hash = hashHex
+				tCtx.Result = "rejected"
+				tCtx.Reason = "invalid-reconstruction"
+				tCtx.Mode = selectedMode
+				tCtx.JobType = info.jobType
+				return BuildSV2Trace(tCtx)
+			}(),
+			"channel_id", submit.ChannelID, "seq", submit.SequenceNumber, "job_id", submit.JobID,
+			"selected_mode", selectedMode,
+			"selected_mode_experimental", selectedModeExperimental,
+			"full_header80_hex", selectedHeaderHex,
+			"double_sha256_header_be", hashHex,
+			"double_sha256_header_le", hex.EncodeToString(headerHashRaw[:]),
+			"meets_network_target", true,
+			"authoritative_mode", authoritativeMode,
+		)
+		c.recordShare(c.workerName, false, 0, selectedDiff, "invalidReconstruction", hashHex, now)
+		c.sendShareError(submit.ChannelID, submit.SequenceNumber, "invalid-reconstruction")
+		return
+	}
+	logger.Debug("sv2 reconstruction authority", "component", "stratum", "kind", "sv2_reconstruction_authority",
+		"remote", c.id, "worker", c.workerName,
+		"channel_id", submit.ChannelID, "seq", submit.SequenceNumber, "job_id", submit.JobID,
+		"sv2_trace", func() string {
+			tCtx := c.newSV2SubmitTraceCtx(submit, info)
+			tCtx.Ver = selectedVersionHex
+			tCtx.NTime = selectedNTimeHex
+			tCtx.Nonce = selectedNonceHex
+			tCtx.NBits = selectedBitsHex
+			tCtx.Prev = selectedPrevHex
+			tCtx.ExN = hex.EncodeToString(standardExtranonce)
+			tCtx.ExNLen = fmt.Sprintf("%d", len(standardExtranonce))
+			tCtx.CoinbaseTxID = selectedCoinbaseTxIDDisplayBE
+			tCtx.Merkle = selectedMerkleRootDisplayBE
+			tCtx.Hdr80 = selectedHeaderHex
+			tCtx.Hash = hashHex
+			tCtx.SDiff = sv2FormatFloat(computedShareDiff)
+			tCtx.TDiff = sv2FormatFloat(shareThreshold)
+			tCtx.NDiff = sv2FormatFloat(networkDiffBDiff)
+			tCtx.ShareTarget = hex.EncodeToString(shareTargetBE[:])
+			tCtx.NetTarget = networkTargetHex
+			if blockFound {
+				tCtx.Result = "block-accepted"
+				tCtx.Reason = "-"
+			} else if isBlock {
+				tCtx.Result = "block-candidate"
+				tCtx.Reason = "-"
+			} else {
+				tCtx.Result = "accepted"
+				tCtx.Reason = "-"
+			}
+			tCtx.Mode = selectedMode
+			tCtx.JobType = info.jobType
+			return BuildSV2Trace(tCtx)
+		}(),
+		"selected_mode", selectedMode,
+		"authoritative_mode", authoritativeMode,
+		"is_block_candidate", isBlock,
+		"submitblock_accepted", blockFound)
+	// Keep parity with SV1: block-valid submits are still valid shares and
+	// should contribute to accepted/share-rate/hashrate accounting.
+	c.recordShare(c.workerName, true, shareThreshold, selectedDiff, "", hashHex, now)
+	c.maybeUpdateSavedWorkerMinuteBestDiff(selectedDiff, now)
+	c.maybeUpdateSavedWorkerBestDiff(selectedDiff)
+	if c.metrics != nil {
+			c.metrics.TrackBestShare(c.workerName, hashHex, selectedDiff, now)
+	}
+	if blockFound && logger.Enabled(logLevelInfo) {
+		stats := c.snapshotShareInfo(now).Stats
+		logger.Info("block found",
+			"component", "stratum",
+			"kind", "sv2",
+			"miner", c.workerName,
+			"height", job.Template.Height,
+			"hash", hashHex,
+			"accepted_total", stats.Accepted,
+			"rejected_total", stats.Rejected,
+			"worker_total_accepted_diff", stats.TotalDifficulty,
+		)
+	}
+
+	atomic.StoreUint32(&c.sequenceAck, submit.SequenceNumber)
+	c.sendShareSuccess(submit.ChannelID, submit.SequenceNumber)
+	c.maybeAdjustDifficulty(now)
 }
 
 func (c *sv2Conn) logFoundBlock(job *Job, worker, hashHex string, shareDiff float64) {

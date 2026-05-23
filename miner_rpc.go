@@ -1,11 +1,112 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"encoding/hex"
 	"fmt"
 	"time"
 )
+
+type submitBlockRPCPreflight struct {
+	rpcHex                        string
+	rpcLen                        int
+	rpcPrefixHex                  string
+	rpcHeader80Hex                string
+	rpcTxCountVarintHex           string
+	rpcFirstTxHex                 string
+	headerMerkleWireLE            string
+	parsedMerkleWireLE            string
+	parsedTxCount                 uint64
+	parsedTxidsWireLE             []string
+	parsedTxCountOffsets          []int
+	parsedTxOffsets               [][2]int
+	merkleDiffOffsets             []int
+	merkleMatchesHeader           bool
+	blockBytes                    []byte
+	parsedHeader80                []byte
+}
+
+func preflightSubmitBlockRPC(blockHex string) (*submitBlockRPCPreflight, error) {
+	raw, err := hex.DecodeString(blockHex)
+	if err != nil {
+		return nil, fmt.Errorf("decode submitblock hex: %w", err)
+	}
+	if len(raw) < 81 {
+		return nil, fmt.Errorf("submitblock payload too short: %d bytes", len(raw))
+	}
+	if len(raw) < 80 {
+		return nil, fmt.Errorf("submitblock header too short: %d bytes", len(raw))
+	}
+	head := make([]byte, 80)
+	copy(head, raw[:80])
+	txCount, txCountLen, err := readVarInt(raw[80:])
+	if err != nil {
+		return nil, fmt.Errorf("parse tx count: %w", err)
+	}
+	offset := 80 + txCountLen
+	if txCount == 0 {
+		return nil, fmt.Errorf("submitblock tx count must be at least 1")
+	}
+	parsedTxids := make([][32]byte, 0, txCount)
+	parsedTxidsWire := make([]string, 0, txCount)
+	parsedTxOffsets := make([][2]int, 0, txCount)
+	var firstTxHex string
+	for i := uint64(0); i < txCount; i++ {
+		txStart := offset
+		if txStart >= len(raw) {
+			return nil, fmt.Errorf("tx %d truncated at offset %d", i, txStart)
+		}
+		txBytes, txid, consumed, err := parseSerializedTxForSubmitBlock(raw[txStart:])
+		if err != nil {
+			return nil, fmt.Errorf("parse tx %d: %w", i, err)
+		}
+		txEnd := txStart + consumed
+		parsedTxOffsets = append(parsedTxOffsets, [2]int{txStart, txEnd})
+		if i == 0 {
+			firstTxHex = hex.EncodeToString(txBytes)
+		}
+		parsedTxids = append(parsedTxids, txid)
+		parsedTxidsWire = append(parsedTxidsWire, hex.EncodeToString(txid[:]))
+		offset = txEnd
+	}
+	if offset != len(raw) {
+		return nil, fmt.Errorf("unexpected trailing submitblock bytes: %d", len(raw)-offset)
+	}
+	recomputedMerkle, ok := sv2ComputeMerkleRootFromTxIDs(parsedTxids)
+	if !ok {
+		return nil, fmt.Errorf("recompute merkle from submitblock txs failed")
+	}
+	headMerkle := raw[36:68]
+	merkleMatches := bytes.Equal(recomputedMerkle[:], headMerkle)
+	diffOffsets := diffHeaderHexByteOffsets(hex.EncodeToString(headMerkle), hex.EncodeToString(recomputedMerkle[:]), 32)
+	return &submitBlockRPCPreflight{
+		rpcHex:               blockHex,
+		rpcLen:               len(blockHex),
+		rpcPrefixHex:         hex.EncodeToString(raw[:minIntSubmitBlock(len(raw), 128)]),
+		rpcHeader80Hex:       hex.EncodeToString(head),
+		rpcTxCountVarintHex:  hex.EncodeToString(raw[80 : 80+txCountLen]),
+		rpcFirstTxHex:        firstTxHex,
+		headerMerkleWireLE:   hex.EncodeToString(headMerkle),
+		parsedMerkleWireLE:   hex.EncodeToString(recomputedMerkle[:]),
+		parsedTxCount:        txCount,
+		parsedTxidsWireLE:    parsedTxidsWire,
+		parsedTxCountOffsets: []int{80, 80 + txCountLen},
+		parsedTxOffsets:      parsedTxOffsets,
+		merkleDiffOffsets:    diffOffsets,
+		merkleMatchesHeader:  merkleMatches,
+		blockBytes:           raw,
+		parsedHeader80:       head,
+	}, nil
+}
+
+func minIntSubmitBlock(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
 
 // submitBlockWithFastRetry aggressively retries submitblock without backoff
 // to maximize the chance of winning the propagation race. It retries every
@@ -29,6 +130,49 @@ func (mc *MinerConn) submitBlockWithFastRetry(job *Job, workerName, hashHex, blo
 	start := time.Now()
 	attempt := 0
 	var lastErr error
+	preflight, err := preflightSubmitBlockRPC(blockHex)
+	if err != nil {
+		logger.Warn("sv2_submitblock_rpc_preflight_failed", "component", "stratum", "kind", "sv2_submitblock_rpc_preflight_failed",
+			"worker", mc.minerName(workerName),
+			"hash", hashHex,
+			"submit_block_rpc_hex", blockHex,
+			"submit_block_rpc_len", len(blockHex),
+			"error", err)
+		return err
+	}
+	logger.Debug("submitblock rpc payload", "component", "stratum", "kind", "submitblock_rpc_payload",
+		"worker", mc.minerName(workerName),
+		"hash", hashHex,
+		"submit_block_rpc_hex", preflight.rpcHex,
+		"submit_block_rpc_len", preflight.rpcLen,
+		"submit_block_rpc_prefix_hex", preflight.rpcPrefixHex,
+		"submit_block_rpc_header80_hex", preflight.rpcHeader80Hex,
+		"submit_block_rpc_tx_count_varint_hex", preflight.rpcTxCountVarintHex,
+		"submit_block_rpc_first_tx_hex", preflight.rpcFirstTxHex,
+		"submit_block_rpc_header_merkle_wire_le", preflight.headerMerkleWireLE,
+		"submit_block_rpc_recomputed_merkle_wire_le", preflight.parsedMerkleWireLE,
+		"submit_block_rpc_tx_count", preflight.parsedTxCount,
+		"submit_block_rpc_txids_wire_le", preflight.parsedTxidsWireLE,
+		"submit_block_rpc_recomputed_merkle_matches_header", preflight.merkleMatchesHeader)
+	if !preflight.merkleMatchesHeader {
+		logger.Warn("sv2_submitblock_rpc_preflight_failed", "component", "stratum", "kind", "sv2_submitblock_rpc_preflight_failed",
+			"worker", mc.minerName(workerName),
+			"hash", hashHex,
+			"submit_block_rpc_hex", preflight.rpcHex,
+			"submit_block_rpc_len", preflight.rpcLen,
+			"submit_block_rpc_header80_hex", preflight.rpcHeader80Hex,
+			"submit_block_rpc_tx_count_varint_hex", preflight.rpcTxCountVarintHex,
+			"submit_block_rpc_first_tx_hex", preflight.rpcFirstTxHex,
+			"parsed_tx_count", preflight.parsedTxCount,
+			"parsed_tx_count_offsets", preflight.parsedTxCountOffsets,
+			"parsed_txids_wire_le", preflight.parsedTxidsWireLE,
+			"parsed_tx_offsets", preflight.parsedTxOffsets,
+			"recomputed_merkle_wire_le", preflight.parsedMerkleWireLE,
+			"header_merkle_wire_le", preflight.headerMerkleWireLE,
+			"byte_diff_offsets", preflight.merkleDiffOffsets)
+		return fmt.Errorf("submitblock preflight: merkle mismatch")
+	}
+	rpcBlockHex := preflight.rpcHex
 
 	blockAccepted := func() bool {
 		if mc.rpc == nil || hashHex == "" {
@@ -54,7 +198,7 @@ func (mc *MinerConn) submitBlockWithFastRetry(job *Job, workerName, hashHex, blo
 		// Use a per-call timeout to prevent indefinite hangs on unresponsive RPC.
 		// The retry loop continues regardless; we just don't want one call to block forever.
 		callCtx, cancel := context.WithTimeout(context.Background(), rpcCallTimeout)
-		err := mc.rpc.callCtx(callCtx, "submitblock", []any{blockHex}, submitRes)
+		err := mc.rpc.callCtx(callCtx, "submitblock", []any{rpcBlockHex}, submitRes)
 		cancel()
 
 		if err == nil {

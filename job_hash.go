@@ -119,6 +119,36 @@ func difficultyFromHash(hash []byte) float64 {
 	return diff
 }
 
+// difficultyFromHashExact computes Bitcoin difficulty from a hash interpreted
+// as a big-endian uint256 value using full big.Float precision.
+func difficultyFromHashExact(hash []byte) float64 {
+	if len(hash) == 0 {
+		return 0
+	}
+	hashInt := new(big.Int).SetBytes(hash)
+	if hashInt.Sign() <= 0 {
+		return math.MaxFloat64
+	}
+	numer := new(big.Float).SetPrec(256).SetInt(diff1Target)
+	denom := new(big.Float).SetPrec(256).SetInt(hashInt)
+	numer.Quo(numer, denom)
+	val, _ := numer.Float64()
+	if math.IsNaN(val) || val <= 0 {
+		return 0
+	}
+	if math.IsInf(val, 0) {
+		return math.MaxFloat64
+	}
+	return val
+}
+
+func targetRatioFromDifficulty(diff float64) float64 {
+	if diff <= 0 {
+		return 0
+	}
+	return 1.0 / diff
+}
+
 func parseRawBlockTip(payload []byte) (ZMQBlockTip, error) {
 	if len(payload) < 80 {
 		return ZMQBlockTip{}, fmt.Errorf("block payload too short")
@@ -463,6 +493,100 @@ func stripWitnessData(raw []byte) ([]byte, bool, error) {
 	stripped = append(stripped, raw[locktimeStart:locktimeStart+4]...)
 
 	return stripped, true, nil
+}
+
+func parseSerializedTxForSubmitBlock(raw []byte) ([]byte, [32]byte, int, error) {
+	var zero [32]byte
+	if len(raw) < 10 {
+		return nil, zero, 0, fmt.Errorf("tx too short: %d bytes", len(raw))
+	}
+
+	idx := 4
+	hasWitness := len(raw) > idx+1 && raw[idx] == 0x00 && raw[idx+1] != 0x00
+	if hasWitness {
+		idx += 2
+	}
+
+	inputsStart := idx
+	vinCount, consumed, err := readVarInt(raw[idx:])
+	if err != nil {
+		return nil, zero, 0, fmt.Errorf("inputs count: %w", err)
+	}
+	idx += consumed
+	for inIdx := range vinCount {
+		if idx+36 > len(raw) {
+			return nil, zero, 0, fmt.Errorf("input %d truncated", inIdx)
+		}
+		idx += 36
+		scriptLen, used, err := readVarInt(raw[idx:])
+		if err != nil {
+			return nil, zero, 0, fmt.Errorf("input %d script len: %w", inIdx, err)
+		}
+		idx += used
+		if idx+int(scriptLen)+4 > len(raw) {
+			return nil, zero, 0, fmt.Errorf("input %d script truncated", inIdx)
+		}
+		idx += int(scriptLen) + 4
+	}
+
+	voutCount, consumed, err := readVarInt(raw[idx:])
+	if err != nil {
+		return nil, zero, 0, fmt.Errorf("outputs count: %w", err)
+	}
+	idx += consumed
+	for outIdx := range voutCount {
+		if idx+8 > len(raw) {
+			return nil, zero, 0, fmt.Errorf("output %d truncated", outIdx)
+		}
+		idx += 8
+		pkLen, used, err := readVarInt(raw[idx:])
+		if err != nil {
+			return nil, zero, 0, fmt.Errorf("output %d script len: %w", outIdx, err)
+		}
+		idx += used
+		if idx+int(pkLen) > len(raw) {
+			return nil, zero, 0, fmt.Errorf("output %d script truncated", outIdx)
+		}
+		idx += int(pkLen)
+	}
+	witnessStart := idx
+	if hasWitness {
+		for inIdx := range vinCount {
+			itemCount, used, err := readVarInt(raw[idx:])
+			if err != nil {
+				return nil, zero, 0, fmt.Errorf("input %d witness count: %w", inIdx, err)
+			}
+			idx += used
+			for itemIdx := range itemCount {
+				itemLen, n, err := readVarInt(raw[idx:])
+				if err != nil {
+					return nil, zero, 0, fmt.Errorf("input %d witness %d len: %w", inIdx, itemIdx, err)
+				}
+				idx += n
+				if idx+int(itemLen) > len(raw) {
+					return nil, zero, 0, fmt.Errorf("input %d witness %d truncated", inIdx, itemIdx)
+				}
+				idx += int(itemLen)
+			}
+		}
+	}
+	if idx+4 > len(raw) {
+		return nil, zero, 0, fmt.Errorf("locktime truncated")
+	}
+	locktimeStart := idx
+	idx += 4
+
+	tx := raw[:idx]
+	var txidInput []byte
+	if hasWitness {
+		txidInput = make([]byte, 0, 4+(witnessStart-inputsStart)+4)
+		txidInput = append(txidInput, raw[:4]...)
+		txidInput = append(txidInput, raw[inputsStart:witnessStart]...)
+		txidInput = append(txidInput, raw[locktimeStart:locktimeStart+4]...)
+	} else {
+		txidInput = tx
+	}
+	return tx, doubleSHA256Array(txidInput), idx, nil
 }
 
 // putVarInt encodes v into dst and returns the number of bytes written.

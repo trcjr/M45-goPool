@@ -1200,7 +1200,7 @@ func (mc *MinerConn) sendNotifyFor(job *Job, forceClean bool) {
 	if poolScript, workerScript, totalValue, feePercent, ok := mc.dualPayoutParams(job, worker); ok {
 		logger.Debug("payout check", "donation_percent", job.OperatorDonationPercent, "donation_script_len", len(job.DonationScript))
 		if job.OperatorDonationPercent > 0 && len(job.DonationScript) > 0 {
-			logger.Debug("using triple payout", "worker", worker, "donation_percent", job.OperatorDonationPercent)
+			logger.Debug("template payout using triple output", "template_payout_worker", worker, "connection_worker", mc.currentWorker(), "donation_percent", job.OperatorDonationPercent)
 			coinb1, coinb2, err = buildTriplePayoutCoinbaseParts(
 				job.Template.Height,
 				mc.extranonce1,
@@ -1274,7 +1274,9 @@ func (mc *MinerConn) sendNotifyFor(job *Job, forceClean bool) {
 	// unless we're forcing a clean notify to pair with a difficulty change.
 	cleanJobs := forceClean || (job.Clean && mc.cleanFlagFor(job))
 	mc.trackJob(job, stratumJobID, cleanJobs)
-	mc.setJobDifficulty(stratumJobID, mc.currentDifficulty())
+	requestedJobDiff := mc.currentDifficulty()
+	effectiveJobDiff := mc.capDifficultyForJob(requestedJobDiff, job, worker)
+	mc.setJobDifficulty(stratumJobID, effectiveJobDiff, requestedJobDiff)
 
 	// Stratum notify shape per docs/protocols/stratum-v1.mediawiki:
 	// [job_id, prevhash, coinb1, coinb2, merkle_branch[], version, nbits, ntime, clean_jobs].

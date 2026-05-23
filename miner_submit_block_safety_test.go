@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -75,9 +76,22 @@ func TestSubmitBlockResultStringIsRejection(t *testing.T) {
 		id:  "submitblock-result-test",
 		rpc: rpc,
 	}
+	coinbaseHex := "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0100ffffffff0100000000000000000000000000"
+	coinbaseRaw, err := hex.DecodeString(coinbaseHex)
+	if err != nil {
+		t.Fatalf("decode coinbase: %v", err)
+	}
+	coinbaseTxID := doubleSHA256Array(coinbaseRaw)
+	header80 := make([]byte, 80)
+	binary.LittleEndian.PutUint32(header80[0:4], 0x20000000)
+	copy(header80[36:68], coinbaseTxID[:])
+	binary.LittleEndian.PutUint32(header80[68:72], 1700000000)
+	binary.LittleEndian.PutUint32(header80[72:76], 0x1d00ffff)
+	binary.LittleEndian.PutUint32(header80[76:80], 1)
+	blockHex := hex.EncodeToString(header80) + "01" + coinbaseHex
 
 	var submitRes any
-	err := mc.submitBlockWithFastRetry(&Job{Template: GetBlockTemplateResult{Height: 1}}, "worker", strings.Repeat("0", 64), "deadbeef", &submitRes)
+	err = mc.submitBlockWithFastRetry(&Job{Template: GetBlockTemplateResult{Height: 1}}, "worker", strings.Repeat("0", 64), blockHex, &submitRes)
 	if err == nil {
 		t.Fatalf("expected submitblock BIP22 result string to be treated as rejection")
 	}
@@ -135,6 +149,64 @@ func TestWinningBlockNotRejectedAsDuplicate(t *testing.T) {
 	rpc := mc.rpc.(*countingSubmitRPC)
 	if got := rpc.submitCalls.Load(); got != 1 {
 		t.Fatalf("expected submitblock to be called once, got %d", got)
+	}
+}
+
+func TestWinningBlockUpdatesShareStatsAndPoolHashrate(t *testing.T) {
+	metrics := NewPoolMetrics()
+	mc := benchmarkMinerConnForSubmit(metrics)
+	mc.assignConnectionSeq()
+	mc.cfg.ShareCheckDuplicate = false
+	mc.cfg.HashrateEMATauSeconds = 60
+	mc.cfg.DataDir = t.TempDir()
+	mc.rpc = &countingSubmitRPC{}
+
+	job := benchmarkSubmitJobForTest(t)
+	job.Target = new(big.Int).Set(maxUint256)
+	jobID := job.JobID
+	mc.jobDifficulty[jobID] = 0.0014
+
+	base := time.Unix(1700000000, 0)
+	task1 := submissionTask{
+		mc:               mc,
+		reqID:            1,
+		job:              job,
+		jobID:            jobID,
+		workerName:       mc.currentWorker(),
+		extranonce2:      "00000000",
+		extranonce2Large: []byte{0, 0, 0, 0},
+		ntime:            "6553f100",
+		ntimeVal:         0x6553f100,
+		nonce:            "00000000",
+		nonceVal:         0x00000000,
+		versionHex:       "00000001",
+		useVersion:       1,
+		scriptTime:       job.ScriptTime,
+		receivedAt:       base,
+	}
+	task2 := task1
+	task2.reqID = 2
+	task2.nonce = "00000001"
+	task2.nonceVal = 0x00000001
+	task2.receivedAt = base.Add(initialHashrateEMATau + time.Second)
+
+	mc.conn = nopConn{}
+	mc.processSubmissionTask(task1)
+	mc.processSubmissionTask(task2)
+	flushFoundBlockLog(t)
+
+	stats := mc.snapshotStats()
+	if stats.Accepted != 2 {
+		t.Fatalf("accepted shares got %d want 2", stats.Accepted)
+	}
+	if stats.WindowAccepted != 2 {
+		t.Fatalf("window accepted shares got %d want 2", stats.WindowAccepted)
+	}
+	if stats.TotalDifficulty <= 0 {
+		t.Fatalf("total difficulty got %v want > 0", stats.TotalDifficulty)
+	}
+	if got := metrics.PoolHashrate(); got <= 0 {
+		t.Fatalf("pool hashrate not updated from block-valid shares: got=%v", got)
 	}
 }
 
@@ -349,7 +421,7 @@ func TestSubmitBlockMatchesNotifyPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode raw tx: %v", err)
 	}
-	txid := reverseBytes(doubleSHA256(rawTx))
+	txid := doubleSHA256(rawTx)
 	job.MerkleBranches = buildMerkleBranches([][]byte{txid})
 	job.Transactions = []GBTTransaction{{Data: rawTxHex, Txid: hex.EncodeToString(txid)}}
 

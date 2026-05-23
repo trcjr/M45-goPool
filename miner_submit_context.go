@@ -137,6 +137,8 @@ func (mc *MinerConn) prepareShareContext(task submissionTask) (shareContext, boo
 	}
 
 	headerHashArray := doubleSHA256Array(header)
+	var headerHashBE [32]byte
+	copy(headerHashBE[:], headerHashArray[:])
 
 	var headerHashLE [32]byte
 	copy(headerHashLE[:], headerHashArray[:])
@@ -151,9 +153,12 @@ func (mc *MinerConn) prepareShareContext(task submissionTask) (shareContext, boo
 	hashHex := hexEncode32LowerString(&headerHashLE)
 
 	ctx := shareContext{
-		hashHex:   hashHex,
-		shareDiff: difficultyFromHash(headerHashArray[:]),
-		isBlock:   isBlock,
+		headerHashBE: headerHashBE,
+		headerHashLE: headerHashLE,
+		hashHex:      hashHex,
+		shareDiff:    difficultyFromHash(headerHashArray[:]),
+		isBlock:      isBlock,
+		merkleRoot:   append([]byte(nil), merkleRoot[:]...),
 	}
 	// Only keep large buffers when detail logging is enabled.
 	if debugLogging || verboseRuntimeLogging {
@@ -161,7 +166,6 @@ func (mc *MinerConn) prepareShareContext(task submissionTask) (shareContext, boo
 		copy(hashLE, headerHashLE[:])
 		ctx.header = header
 		ctx.cbTx = cbTx
-		ctx.merkleRoot = append([]byte(nil), merkleRoot[:]...)
 		ctx.hashLE = hashLE
 	}
 	return ctx, true
