@@ -40,6 +40,8 @@ type stratumConfig struct {
 	StratumPassword        string `toml:"stratum_password"`
 	StratumPasswordPublic  bool   `toml:"stratum_password_public"`
 	SafeMode               bool   `toml:"safe_mode"`
+	StratumV2NoiseKeyPath  string `toml:"stratum_v2_noise_key_path"`
+	StratumV2AuthorityKeyPath string `toml:"stratum_v2_authority_key_path"`
 }
 
 type authConfig struct {
@@ -280,6 +282,8 @@ type secretsConfig struct {
 	RPCUser                 string `toml:"rpc_user"`
 	RPCPass                 string `toml:"rpc_pass"`
 	DiscordBotToken         string `toml:"discord_token"`
+	StratumV2NoiseKeyBase64 string `toml:"stratum_v2_noise_key_base64"`
+	StratumV2AuthorityKeyBase64 string `toml:"stratum_v2_authority_key_base64"`
 	ClerkSecretKey          string `toml:"clerk_secret_key"`
 	ClerkPublishableKey     string `toml:"clerk_publishable_key"`
 	BackblazeAccountID      string `toml:"backblaze_account_id"`

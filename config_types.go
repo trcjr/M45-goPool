@@ -15,6 +15,11 @@ rpc_pass = "password"
 # clerk_secret_key = "sk_test_..."
 # clerk_publishable_key = "pk_test_..."
 
+# Optional Stratum V2 static keys as base64-encoded 32-byte private keys.
+# If set, these override path-based key loading.
+# stratum_v2_noise_key_base64 = "..."
+# stratum_v2_authority_key_base64 = "..."
+
 # Backblaze B2 credentials for database backups (optional).
 # Note: Backblaze requires a "key ID" + "application key" pair.
 # - If using an Application Key you created in B2, use its Key ID here.
@@ -51,6 +56,19 @@ type Config struct {
 
 	// Stratum TLS (empty to disable).
 	StratumTLSListen string
+	// StratumV2NoiseKeyBase64 optionally provides the Stratum V2 NOISE static
+	// key as base64 in secrets.toml.
+	StratumV2NoiseKeyBase64 string
+	// StratumV2AuthorityKeyBase64 optionally provides the Pool Authority signing
+	// key as base64 in secrets.toml.
+	StratumV2AuthorityKeyBase64 string
+	// StratumV2NoiseKeyPath is the path to the Stratum V2 NOISE static key file.
+	// If empty, defaults to <DataDir>/state/sv2_noise_key.bin.
+	StratumV2NoiseKeyPath string
+	// StratumV2AuthorityKeyPath is the path to the Pool Authority signing key.
+	// If empty, the pool runs in simplified bootstrap mode where the authority
+	// signing key is derived from the NOISE static key.
+	StratumV2AuthorityKeyPath string
 	// Stratum auth (optional; when enabled, require miners to send the password in mining.authorize).
 	StratumPasswordEnabled bool
 	StratumPassword        string

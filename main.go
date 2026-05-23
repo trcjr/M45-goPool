@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"encoding/hex"
@@ -20,6 +21,17 @@ import (
 	"syscall"
 	"time"
 )
+
+// peekedConn preserves bytes already buffered by a bufio.Reader while
+// continuing to use the original net.Conn for writes/deadlines/close.
+type peekedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *peekedConn) Read(p []byte) (int, error) {
+	return c.r.Read(p)
+}
 
 func main() {
 	// Top-level panic handler: ensure any unexpected panic is captured to
@@ -355,6 +367,58 @@ func main() {
 	metrics := NewPoolMetrics()
 	metrics.SetStartTime(startTime)
 	metrics.SetBestSharesDB(cfg.DataDir)
+
+	// Load Stratum V2 keys from secrets/config.
+	var (
+		noiseKey           *sv2StaticKey
+		authorityKey       *sv2AuthorityKey
+		noiseKeySource     string
+		authorityKeySource string
+	)
+	noiseKeyBase64 := strings.TrimSpace(cfg.StratumV2NoiseKeyBase64)
+	if noiseKeyBase64 != "" {
+		noiseKey, err = loadSV2KeyFromBase64(noiseKeyBase64)
+		if err != nil {
+			fatal("sv2 noise key", err)
+		}
+		noiseKeySource = "base64"
+	} else {
+		sv2KeyPath := strings.TrimSpace(cfg.StratumV2NoiseKeyPath)
+		if sv2KeyPath == "" {
+			sv2KeyPath = filepath.Join(strings.TrimSpace(cfg.DataDir), "state", "sv2_noise_key.bin")
+			if strings.TrimSpace(cfg.DataDir) == "" {
+				sv2KeyPath = filepath.Join(defaultDataDir, "state", "sv2_noise_key.bin")
+			}
+		}
+		noiseKey, err = loadOrGenerateSV2Key(sv2KeyPath)
+		if err != nil {
+			fatal("sv2 noise key", err)
+		}
+		noiseKeySource = "path"
+	}
+
+	authorityKeyBase64 := strings.TrimSpace(cfg.StratumV2AuthorityKeyBase64)
+	authorityKeyPath := strings.TrimSpace(cfg.StratumV2AuthorityKeyPath)
+	if authorityKeyBase64 != "" {
+		authorityKey, err = loadSV2AuthorityKeyFromBase64(authorityKeyBase64)
+		if err != nil {
+			fatal("sv2 authority key", err)
+		}
+		authorityKeySource = "base64"
+	} else if authorityKeyPath != "" {
+		authorityKey, err = loadOrGenerateSV2AuthorityKey(authorityKeyPath)
+		if err != nil {
+			fatal("sv2 authority key", err)
+		}
+		authorityKeySource = "path"
+	} else {
+		authorityKey = sv2AuthorityKeyFromStaticKey(noiseKey)
+		authorityKeySource = "derived_from_noise"
+		logger.Warn("stratum v2 authority key not configured; using simplified bootstrap mode", "component", "stratum", "kind", "sv2", "mode", "authority_equals_noise_static", "note", "non-production compatibility mode")
+	}
+	logger.Info("stratum v2 transport keys loaded", "component", "stratum", "kind", "sv2", "noise_pubkey_hex", noiseKey.pubHex(), "authority_pubkey_hex", authorityKey.pubHex(), "authority_key", authorityKey.authKeyBase58Check())
+	logger.Info("stratum v2 transport key sources", "component", "stratum", "kind", "sv2", "noise_source", noiseKeySource, "authority_source", authorityKeySource)
+
 	clerkVerifier := (*ClerkVerifier)(nil)
 	if clerkConfigured(cfg) {
 		var clerkErr error
@@ -423,6 +487,7 @@ func main() {
 
 	registry := NewMinerRegistry()
 	workerRegistry := newWorkerConnectionRegistry()
+	sv2Registry := newSV2WorkerRegistry()
 
 	var reconnectLimiter *reconnectTracker
 	if cfg.ReconnectBanThreshold > 0 && cfg.ReconnectBanWindowSeconds > 0 && cfg.ReconnectBanDurationSeconds > 0 {
@@ -826,14 +891,14 @@ func main() {
 			if !acceptLimiter.wait(ctx) {
 				break
 			}
-			conn, err := l.Accept()
-			if err != nil {
-				if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
-					break
-				}
-				logger.Error("accept error", "component", "stratum", "kind", "accept", "listener", label, "error", err)
-				continue
-			}
+			       conn, err := l.Accept()
+			       if err != nil {
+				       if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+					       break
+				       }
+				       logger.Error("accept error", "component", "stratum", "kind", "accept", "listener", label, "error", err)
+				       continue
+			       }
 			disableTCPNagle(conn)
 			curCfg := statusServer.Config()
 			setTCPBuffers(conn, curCfg.StratumTCPReadBufferBytes, curCfg.StratumTCPWriteBufferBytes)
@@ -883,17 +948,52 @@ func main() {
 				_ = conn.Close()
 				continue
 			}
-			mc := NewMinerConn(ctx, conn, jobMgr, rpcClient, curCfg, metrics, accounting, workerRegistry, workerLists, notifier, label == "tls")
-			registry.Add(mc)
 
-			connWg.Add(1)
-			go func(mc *MinerConn) {
-				defer connWg.Done()
-				// Always remove connection from the map when this goroutine ends.
-				defer registry.Remove(mc)
-
-				mc.handle()
-			}(mc)
+			// Probe enough bytes to distinguish JSON-RPC, plaintext SV2, and
+			// the best-effort encrypted-SV2 fallback on the shared listener.
+			reader := bufio.NewReaderSize(conn, maxStratumMessageSize)
+			protocolKind, detectErr := detectStratumProtocol(conn, reader, curCfg)
+			if detectErr != nil {
+				logger.Warn("sv2 protocol probe failed", "component", "stratum", "kind", "probe", "listener", label, "remote", conn.RemoteAddr().String(), "error", detectErr)
+				_ = conn.Close()
+				continue
+			}
+			if protocolKind == sv2ProtocolSV1JSON {
+				sv1Conn := &peekedConn{Conn: conn, r: reader}
+				mc := NewMinerConn(ctx, sv1Conn, jobMgr, rpcClient, curCfg, metrics, accounting, workerRegistry, workerLists, notifier, label == "tls")
+				registry.Add(mc)
+				connWg.Add(1)
+				go func(mc *MinerConn) {
+					defer connWg.Done()
+					defer registry.Remove(mc)
+					mc.handle()
+				}(mc)
+			} else if protocolKind == sv2ProtocolEncrypted {
+				noiseConn := &peekedConn{Conn: conn, r: reader}
+				encConn, noiseErr := sv2NoiseHandshake(noiseConn, noiseKey, authorityKey)
+				if noiseErr != nil {
+					logger.Warn("sv2 noise handshake failed", "component", "stratum", "kind", "sv2",
+						"listener", label, "remote", conn.RemoteAddr().String(), "error", noiseErr,
+						"hint", "client may be using an incompatible EllSwift Noise implementation")
+					_ = conn.Close()
+					continue
+				}
+				sv2c := NewSV2Conn(encConn, jobMgr, rpcClient, curCfg, metrics, accounting, workerRegistry, sv2Registry, workerLists, label == "tls")
+				connWg.Add(1)
+				go func() {
+					defer connWg.Done()
+					sv2c.handle()
+				}()
+			} else {
+				// Plaintext SV2: reuse the peeked reader.
+				sv2c := NewSV2Conn(conn, jobMgr, rpcClient, curCfg, metrics, accounting, workerRegistry, sv2Registry, workerLists, label == "tls")
+				sv2c.reader = reader
+				connWg.Add(1)
+				go func() {
+					defer connWg.Done()
+					sv2c.handle()
+				}()
+			}
 		}
 	}
 	// Plain Stratum listener runs in the main goroutine so process

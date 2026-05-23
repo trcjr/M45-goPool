@@ -259,6 +259,12 @@ func applyBaseConfig(cfg *Config, fc baseFileConfigRead) (configChanged bool, mi
 	}
 	cfg.StratumPasswordPublic = fc.Stratum.StratumPasswordPublic
 	cfg.SafeMode = fc.Stratum.SafeMode
+	if fc.Stratum.StratumV2NoiseKeyPath != "" {
+		cfg.StratumV2NoiseKeyPath = strings.TrimSpace(fc.Stratum.StratumV2NoiseKeyPath)
+	}
+	if fc.Stratum.StratumV2AuthorityKeyPath != "" {
+		cfg.StratumV2AuthorityKeyPath = strings.TrimSpace(fc.Stratum.StratumV2AuthorityKeyPath)
+	}
 	if fc.Node.RPCURL != "" {
 		cfg.RPCURL = fc.Node.RPCURL
 	}
@@ -652,6 +658,12 @@ func applyTuningConfig(cfg *Config, fc tuningFileConfig) {
 func applySecretsConfig(cfg *Config, sc secretsConfig) {
 	if sc.DiscordBotToken != "" {
 		cfg.DiscordBotToken = strings.TrimSpace(sc.DiscordBotToken)
+	}
+	if sc.StratumV2NoiseKeyBase64 != "" {
+		cfg.StratumV2NoiseKeyBase64 = strings.TrimSpace(sc.StratumV2NoiseKeyBase64)
+	}
+	if sc.StratumV2AuthorityKeyBase64 != "" {
+		cfg.StratumV2AuthorityKeyBase64 = strings.TrimSpace(sc.StratumV2AuthorityKeyBase64)
 	}
 	if sc.ClerkSecretKey != "" {
 		cfg.ClerkSecretKey = sc.ClerkSecretKey
