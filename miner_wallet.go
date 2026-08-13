@@ -301,22 +301,10 @@ func (mc *MinerConn) maybeUpdateSavedWorkerMinuteBestDiffHash(hash string, diff 
 	if mc == nil || mc.savedWorkerStore == nil || hash == "" || diff <= 0 {
 		return
 	}
-	mc.savedWorkerMu.Lock()
-	isCurrent := mc.registeredWorkerHash == hash
-	tracked := mc.savedWorkerTracked
-	syncing := isCurrent && mc.savedWorkerSyncing
-	mc.savedWorkerMu.Unlock()
-	if !isCurrent || syncing {
-		var err error
-		_, tracked, err = mc.savedWorkerStore.BestDifficultyForHash(hash)
-		if err != nil {
-			logger.Warn("saved worker minute lookup failed", "error", err, "hash", hash)
-			return
-		}
-	}
-	if tracked {
-		mc.savedWorkerStore.UpdateSavedWorkerMinuteBestDifficulty(hash, diff, now)
-	}
+	// Minute-best samples also feed the pool-wide best-share graph. Keep this
+	// transient data for every submitting worker; the period sampler still
+	// limits individual worker history persistence to saved workers.
+	mc.savedWorkerStore.UpdateSavedWorkerMinuteBestDifficulty(hash, diff, now)
 }
 
 // singlePayoutScript selects the output script for single-output coinbase

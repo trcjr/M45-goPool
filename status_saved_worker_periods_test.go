@@ -100,8 +100,8 @@ func TestRecordSavedOnlineWorkerPeriodsRecordsPoolBestShareForSampledMinuteOnly(
 	hashB := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	hashC := "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 
-	// Register A and B as saved workers; C is intentionally omitted so its
-	// ring-buffer entry (if any) is ignored by the pool aggregation.
+	// Register A and B as saved workers. C is intentionally omitted, but its
+	// shares must still contribute to the pool-wide best-share series.
 	for _, h := range []string{hashA, hashB} {
 		if _, err := store.db.Exec(
 			"INSERT OR IGNORE INTO saved_workers (user_id, worker, worker_hash, worker_display, notify_enabled) VALUES (?, ?, ?, ?, 1)",
@@ -119,7 +119,8 @@ func TestRecordSavedOnlineWorkerPeriodsRecordsPoolBestShareForSampledMinuteOnly(
 	// best-share path reads via ConsumeSavedWorkerMinuteBestDifficulty.
 	store.UpdateSavedWorkerMinuteBestDifficulty(hashA, 1200, sampleBucket.Add(10*time.Second))
 	store.UpdateSavedWorkerMinuteBestDifficulty(hashB, 3400, sampleBucket.Add(20*time.Second))
-	// C has a high difficulty but is not a saved worker — must not affect pool best.
+	// C has the highest difficulty and is not a saved worker. It must still
+	// affect the pool best while receiving no individual persisted history.
 	store.UpdateSavedWorkerMinuteBestDifficulty(hashC, 9900, sampleBucket.Add(5*time.Second))
 
 	s := &StatusServer{
@@ -147,7 +148,10 @@ func TestRecordSavedOnlineWorkerPeriodsRecordsPoolBestShareForSampledMinuteOnly(
 		t.Fatalf("missing %q history ring", savedWorkerPeriodPoolKey)
 	}
 	gotBest := decodeBestShareSI16(ring.bestDifficultyQ[idx])
-	if gotBest < 3000 || gotBest > 3800 {
-		t.Fatalf("pool best-share decoded=%v, expected around 3400", gotBest)
+	if gotBest < 9000 || gotBest > 11000 {
+		t.Fatalf("pool best-share decoded=%v, expected around 9900", gotBest)
+	}
+	if _, ok := s.savedWorkerPeriods[hashC]; ok {
+		t.Fatalf("unsaved worker unexpectedly received individual period history")
 	}
 }
