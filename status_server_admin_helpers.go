@@ -216,7 +216,7 @@ func (s *StatusServer) renderAdminPageTemplate(w http.ResponseWriter, r *http.Re
 func adminNoticeMessage(key string) string {
 	switch key {
 	case "settings_applied":
-		return "Live settings applied in memory."
+		return "Settings applied in memory. Job and payout settings apply on the next published job; existing miner-session settings apply after reconnect; listener, node, and storage settings require a process restart."
 	case "saved_to_disk":
 		return "Saved current in-memory settings to config.toml, services.toml, policy.toml, and tuning.toml."
 	case "reboot_requested":
@@ -321,7 +321,6 @@ func buildAdminSettingsData(cfg Config) AdminSettingsData {
 		MinVersionBits:                       cfg.MinVersionBits,
 		ShareAllowOutOfMaskVersionBits:       cfg.ShareAllowOutOfMaskVersionBits,
 		ShareAllowDegradedVersionBits:        cfg.ShareAllowDegradedVersionBits,
-		BIP110Enabled:                        cfg.BIP110Enabled,
 	}
 }
 
@@ -806,7 +805,6 @@ func applyAdminSettingsForm(cfg *Config, r *http.Request) error {
 	next.ShareCheckDuplicate = getBool("share_check_duplicate")
 	next.ShareAllowOutOfMaskVersionBits = getBool("share_allow_out_of_mask_version_bits")
 	next.ShareAllowDegradedVersionBits = getBool("share_allow_degraded_version_bits")
-	next.BIP110Enabled = getBool("bip110_enabled")
 	next.VarDiffEnabled = getBool("vardiff_enabled")
 
 	if next.Extranonce2Size, err = parseInt("extranonce2_size", next.Extranonce2Size); err != nil {
@@ -829,6 +827,9 @@ func applyAdminSettingsForm(cfg *Config, r *http.Request) error {
 	}
 	if next.CoinbaseScriptSigMaxBytes, err = parseInt("coinbase_scriptsig_max_bytes", next.CoinbaseScriptSigMaxBytes); err != nil {
 		return err
+	}
+	if next.CoinbaseScriptSigMaxBytes < minCoinbaseScriptSigBytes || next.CoinbaseScriptSigMaxBytes > maxCoinbaseScriptSigBytes {
+		return fmt.Errorf("coinbase_scriptsig_max_bytes must be between %d and %d", minCoinbaseScriptSigBytes, maxCoinbaseScriptSigBytes)
 	}
 	if next.MinVersionBits, err = parseInt("min_version_bits", next.MinVersionBits); err != nil {
 		return err

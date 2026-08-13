@@ -5,10 +5,19 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
 func (jm *JobManager) buildJob(ctx context.Context, tpl GetBlockTemplateResult) (*Job, error) {
+	jm.applyMu.Lock()
+	defer jm.applyMu.Unlock()
+	return jm.buildJobLocked(ctx, tpl)
+}
+
+// buildJobLocked builds from one coherent runtime configuration snapshot.
+// The caller must hold jm.applyMu.
+func (jm *JobManager) buildJobLocked(ctx context.Context, tpl GetBlockTemplateResult) (*Job, error) {
 	if len(jm.payoutScript) == 0 {
 		return nil, fmt.Errorf("payout script not configured")
 	}
@@ -26,13 +35,13 @@ func (jm *JobManager) buildJob(ctx context.Context, tpl GetBlockTemplateResult) 
 		return nil, err
 	}
 
-	txids, err := validateTransactions(tpl.Transactions)
+	transactions, err := validateTransactions(tpl.Transactions)
 	if err != nil {
 		return nil, err
 	}
 	tpl.Version = applyConfiguredVersionBits(tpl.Version, jm.cfg)
 
-	merkleBranches := buildMerkleBranches(txids)
+	merkleBranches := buildMerkleBranches(transactions)
 	merkleBranchesBytes, err := decodeMerkleBranchesBytes(merkleBranches)
 	if err != nil {
 		return nil, err
@@ -47,16 +56,21 @@ func (jm *JobManager) buildJob(ctx context.Context, tpl GetBlockTemplateResult) 
 		}
 		coinbaseMsg = msg
 	}
-	if jm.cfg.CoinbaseScriptSigMaxBytes > 0 {
-		trimmed, truncated, err := clampCoinbaseMessage(coinbaseMsg, jm.cfg.CoinbaseScriptSigMaxBytes, tpl.Height, scriptTime, tpl.CoinbaseAux.Flags, jm.cfg.Extranonce2Size, jm.cfg.TemplateExtraNonce2Size)
-		if err != nil {
-			return nil, fmt.Errorf("coinbase scriptsig limit: %w", err)
-		}
-		if truncated {
-			logger.Debug("clamped coinbase message to meet scriptSig limit", "limit", jm.cfg.CoinbaseScriptSigMaxBytes, "message", trimmed)
-		}
-		coinbaseMsg = trimmed
+	coinbaseScriptSigMaxBytes := jm.cfg.CoinbaseScriptSigMaxBytes
+	if coinbaseScriptSigMaxBytes == 0 {
+		// Config validation rejects an explicit zero. Keep direct/internal
+		// JobManager construction safe by treating an omitted zero value as the
+		// consensus maximum instead of disabling the limit.
+		coinbaseScriptSigMaxBytes = maxCoinbaseScriptSigBytes
 	}
+	trimmed, truncated, err := clampCoinbaseMessage(coinbaseMsg, coinbaseScriptSigMaxBytes, tpl.Height, scriptTime, tpl.CoinbaseAux.Flags, jm.cfg.Extranonce2Size, jm.cfg.TemplateExtraNonce2Size)
+	if err != nil {
+		return nil, fmt.Errorf("coinbase scriptsig limit: %w", err)
+	}
+	if truncated {
+		logger.Debug("clamped coinbase message to meet scriptSig limit", "limit", coinbaseScriptSigMaxBytes, "message", trimmed)
+	}
+	coinbaseMsg = trimmed
 
 	var prevBytes [32]byte
 	if len(tpl.Previous) != 64 {
@@ -90,30 +104,35 @@ func (jm *JobManager) buildJob(ctx context.Context, tpl GetBlockTemplateResult) 
 	}
 
 	job := &Job{
-		JobID:                   jm.nextJobID(),
-		Template:                tpl,
-		Target:                  target,
-		targetBE:                uint256BEFromBigInt(target),
-		CreatedAt:               time.Now(),
-		ScriptTime:              scriptTime,
-		Extranonce2Size:         jm.cfg.Extranonce2Size,
-		CoinbaseValue:           tpl.CoinbaseValue,
-		WitnessCommitment:       tpl.DefaultWitnessCommitment,
-		CoinbaseMsg:             coinbaseMsg,
-		MerkleBranches:          merkleBranches,
-		merkleBranchesBytes:     merkleBranchesBytes,
-		Transactions:            tpl.Transactions,
-		TransactionIDs:          txids,
-		PayoutScript:            jm.payoutScript,
-		DonationScript:          jm.donationScript,
-		OperatorDonationPercent: jm.cfg.OperatorDonationPercent,
-		VersionMask:             computePoolMask(tpl, jm.cfg),
-		PrevHash:                tpl.Previous,
-		prevHashBytes:           prevBytes,
-		bitsBytes:               bitsBytes,
-		coinbaseFlagsBytes:      flagsBytes,
-		witnessCommitScript:     commitScript,
-		TemplateExtraNonce2Size: jm.cfg.TemplateExtraNonce2Size,
+		JobID:                     jm.nextJobID(),
+		Generation:                atomic.AddUint64(&jm.jobGeneration, 1),
+		Template:                  tpl,
+		Target:                    target,
+		targetBE:                  uint256BEFromBigInt(target),
+		CreatedAt:                 time.Now(),
+		ScriptTime:                scriptTime,
+		Extranonce2Size:           jm.cfg.Extranonce2Size,
+		CoinbaseValue:             tpl.CoinbaseValue,
+		WitnessCommitment:         tpl.DefaultWitnessCommitment,
+		CoinbaseMsg:               coinbaseMsg,
+		MerkleBranches:            merkleBranches,
+		merkleBranchesBytes:       merkleBranchesBytes,
+		Transactions:              tpl.Transactions,
+		TransactionIDs:            transactionIDs(transactions),
+		PayoutScript:              append([]byte(nil), jm.payoutScript...),
+		PayoutAddress:             jm.cfg.PayoutAddress,
+		PoolFeePercent:            jm.cfg.PoolFeePercent,
+		PayoutPolicyCaptured:      true,
+		DonationScript:            append([]byte(nil), jm.donationScript...),
+		OperatorDonationPercent:   jm.cfg.OperatorDonationPercent,
+		VersionMask:               computePoolMask(tpl, jm.cfg),
+		PrevHash:                  tpl.Previous,
+		prevHashBytes:             prevBytes,
+		bitsBytes:                 bitsBytes,
+		coinbaseFlagsBytes:        flagsBytes,
+		witnessCommitScript:       commitScript,
+		TemplateExtraNonce2Size:   jm.cfg.TemplateExtraNonce2Size,
+		CoinbaseScriptSigMaxBytes: coinbaseScriptSigMaxBytes,
 	}
 
 	return job, nil
@@ -159,44 +178,26 @@ func buildPoolSuffix(poolEntropy string, jobEntropy int) (string, error) {
 }
 
 func computePoolMask(tpl GetBlockTemplateResult, cfg Config) uint32 {
-	base := defaultVersionMask
-	if cfg.VersionMaskConfigured {
-		base = cfg.VersionMask
+	base := cfg.VersionMask
+	if base == 0 && !cfg.VersionMaskConfigured {
+		base = defaultVersionMask
 	}
-	if base == 0 {
-		return 0
-	}
-
-	// Keep version rolling available to miners even when the template does not
-	// advertise version mutability, since some bitcoind templates omit that
-	// flag. Falling back to the configured base mask avoids sending a zero mask
-	// (which would disable ASIC rolling on miners like ESP-Miner).
-	if !versionMutable(tpl.Mutable) {
-		return base
-	}
-
 	mask := base
-	mask &^= uint32(tpl.VbRequired)
 
-	active := make(map[string]struct{})
-	for _, rule := range tpl.Rules {
-		active[rule] = struct{}{}
-	}
-	for name, bit := range tpl.VbAvailable {
-		if _, ok := active[name]; !ok {
-			continue
-		}
+	// Version-rolling is useful even though Bitcoin Core commonly omits
+	// version/* from mutable. Regardless of that metadata, never delegate bits
+	// whose values are controlled by the node or by pool policy.
+	mask &^= uint32(tpl.VbRequired)
+	for _, bit := range tpl.VbAvailable {
 		if bit < 0 || bit >= 32 {
 			continue
 		}
 		mask &^= uint32(1) << uint(bit)
 	}
-
-	if mask == 0 {
-		// Avoid broadcasting a zero mask that would turn off version rolling on
-		// miners which assume a non-zero range (e.g., ESP-Miner). Fall back to the
-		// configured base mask in that rare case.
-		return base
+	for bit := range cfg.VersionBitOverrides {
+		if bit <= 31 {
+			mask &^= uint32(1) << bit
+		}
 	}
 
 	return mask

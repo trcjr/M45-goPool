@@ -181,7 +181,7 @@ func (s *StatusServer) recordSavedOnlineWorkerPeriods(allWorkers []WorkerView, n
 	var poolBestQ uint16
 	bestQByHash := make(map[string]uint16, len(onlineAll))
 	if s.workerLists != nil {
-		for hash := range onlineAll {
+		for hash := range onlineSaved {
 			bestQ := encodeBestShareSI16(s.workerLists.ConsumeSavedWorkerMinuteBestDifficulty(hash, sampleBucket))
 			if bestQ > 0 {
 				bestQByHash[hash] = bestQ

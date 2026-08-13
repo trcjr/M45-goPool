@@ -143,7 +143,7 @@ func tuningConfigDocComments() []byte {
 # - extranonce2_size: Per-share extranonce2 byte length used for submit parsing and validation; 4 is the broadest compatibility default, and 2-16 is the supported compatibility range (requires restart).
 # - template_extra_nonce2_size: Template extranonce2 byte length used in generated jobs (requires restart).
 # - job_entropy: Entropy bytes added to per-job coinbase tags (requires restart).
-# - coinbase_scriptsig_max_bytes: Maximum allowed coinbase scriptSig size in bytes (requires restart).
+# - coinbase_scriptsig_max_bytes: Maximum allowed coinbase scriptSig size in bytes (2-100; requires restart).
 #
 # Hashrate ([hashrate])
 # - hashrate_ema_tau_seconds: EMA time constant for per-connection hashrate smoothing (seconds; requires restart).
@@ -180,13 +180,9 @@ func policyConfigDocComments() []byte {
 #
 # Version policy ([version])
 # - min_version_bits: minimum version-rolling bit count advertised/negotiated with miners; not a per-share changed-bit requirement.
-# - share_allow_out_of_mask_version_bits: allow miners to submit version bits
-#   outside the negotiated version-rolling mask (useful for BIP-110 bit 4 signaling).
+# - share_allow_out_of_mask_version_bits: allow legacy miners to submit version
+#   bits outside the negotiated version-rolling mask.
 # - share_allow_degraded_version_bits: retained compatibility flag; in-mask BIP310 submits are accepted even when fewer bits change on a single share.
-# - bip110_enabled: set BIP-110 signaling bit 4 on generated templates.
-#   Reference: https://github.com/bitcoin/bips/blob/master/bip-0110.mediawiki
-#   Note: version_bits.toml is applied after this flag and can still force
-#   bit 4 on/off.
 #
 # Timeouts ([timeouts])
 # - connection_timeout_seconds
@@ -250,8 +246,7 @@ func exampleVersionBitsConfigBytes() []byte {
 # This file is READ ONLY from goPool's perspective:
 # - goPool never rewrites version_bits.toml.
 # - Entries are applied in order; later entries for the same bit win.
-# - Overrides here are applied after policy.toml [version].bip110_enabled.
-#   If both touch bit 4, this file wins.
+# - Overrides here are applied directly to the node's template version.
 #
 # Format:
 # [[bits]]

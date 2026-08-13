@@ -17,51 +17,63 @@ import (
 var nextConnectionID uint64
 
 func (mc *MinerConn) cleanup() {
-	mc.cleanupOnce.Do(func() {
-		mc.unregisterRegisteredWorker()
+	mc.cleanupOnce.Do(mc.cleanupResources)
+}
 
-		// Close stats channel and wait for worker to finish processing.
-		// Some tests build lightweight MinerConn instances without a stats
-		// worker/channel; guard those cases.
-		if mc.statsUpdates != nil {
-			close(mc.statsUpdates)
-			mc.statsWg.Wait()
-		}
+func (mc *MinerConn) cleanupResources() {
+	// Publish the terminal state before closing subscriptions or the socket.
+	// A closed buffered job channel may still be drained by listenJobs, and
+	// concurrent notify callers may already be waiting on notifyMu.
+	mc.closed.Store(true)
+	// Break transport I/O promptly. Registry and stats cleanup can involve
+	// storage work and must not leave a failed session writable meanwhile.
+	if mc.conn != nil {
+		_ = mc.conn.Close()
+	}
+	mc.unregisterRegisteredWorker()
 
-		if mc.metrics != nil {
-			if connSeq := atomic.LoadUint64(&mc.connectionSeq); connSeq != 0 {
-				mc.metrics.RemoveConnectionHashrate(connSeq)
-			}
-		}
+	// Close stats channel and wait for worker to finish processing.
+	// Some tests build lightweight MinerConn instances without a stats
+	// worker/channel; guard those cases.
+	if mc.statsUpdates != nil {
+		close(mc.statsUpdates)
+		mc.statsWg.Wait()
+	}
 
-		mc.statsMu.Lock()
-		mc.stats.WindowStart = time.Time{}
-		mc.stats.WindowAccepted = 0
-		mc.stats.WindowSubmissions = 0
-		mc.stats.WindowDifficulty = 0
-		mc.vardiffWindowStart = time.Time{}
-		mc.vardiffWindowResetAnchor = time.Time{}
-		mc.vardiffWindowAccepted = 0
-		mc.vardiffWindowSubmissions = 0
-		mc.vardiffWindowDifficulty = 0
-		mc.lastHashrateUpdate = time.Time{}
-		mc.rollingHashrateValue = 0
-		mc.statsMu.Unlock()
-		if mc.jobMgr != nil && mc.jobCh != nil {
-			mc.jobMgr.Unsubscribe(mc.jobCh)
+	if mc.metrics != nil {
+		if connSeq := atomic.LoadUint64(&mc.connectionSeq); connSeq != 0 {
+			mc.metrics.RemoveConnectionHashrate(connSeq)
 		}
-		if mc.conn != nil {
-			_ = mc.conn.Close()
-		}
-	})
+	}
+
+	mc.statsMu.Lock()
+	mc.stats.WindowStart = time.Time{}
+	mc.stats.WindowAccepted = 0
+	mc.stats.WindowSubmissions = 0
+	mc.stats.WindowDifficulty = 0
+	mc.vardiffWindowStart = time.Time{}
+	mc.vardiffWindowResetAnchor = time.Time{}
+	mc.vardiffWindowAccepted = 0
+	mc.vardiffWindowSubmissions = 0
+	mc.vardiffWindowDifficulty = 0
+	mc.lastHashrateUpdate = time.Time{}
+	mc.rollingHashrateValue = 0
+	mc.statsMu.Unlock()
+	if mc.jobMgr != nil && mc.jobCh != nil {
+		mc.jobMgr.Unsubscribe(mc.jobCh)
+	}
 }
 
 func (mc *MinerConn) Close(reason string) {
 	if reason == "" {
 		reason = "shutdown"
 	}
-	logger.Info("closing miner", "component", "miner", "kind", "lifecycle", "remote", mc.id, "reason", reason)
-	mc.cleanup()
+	mc.cleanupOnce.Do(func() {
+		// Keep the lifecycle log coupled to the cleanup winner. Concurrent or
+		// follow-up terminal paths should not emit duplicate close records.
+		logger.Info("closing miner", "component", "miner", "kind", "lifecycle", "remote", mc.id, "reason", reason)
+		mc.cleanupResources()
+	})
 }
 
 func (mc *MinerConn) assignConnectionSeq() {
@@ -159,6 +171,8 @@ func NewMinerConn(ctx context.Context, c net.Conn, jobMgr *JobManager, rpc rpcCa
 		discordNotifier:   notifier,
 		activeJobs:        make(map[string]*Job, maxRecentJobs), // Pre-allocate for expected job count
 		jobOrder:          make([]string, 0, maxRecentJobs),
+		retiredJobs:       make(map[string]retiredJobBinding, maxRecentJobs),
+		retiredJobOrder:   make([]string, 0, maxRecentJobs),
 		connectedAt:       now,
 		lastActivity:      now,
 		jobDifficulty:     make(map[string]float64, maxRecentJobs), // Pre-allocate for expected job count
@@ -235,47 +249,6 @@ func versionRollingPolicyFromConfig(cfg Config) (uint32, int) {
 		minBits = bits.OnesCount32(mask)
 	}
 	return mask, minBits
-}
-
-// ApplyRuntimeConfig updates runtime-safe Stratum policy settings for an
-// already-connected miner. Some structural settings still only apply fully on
-// reconnect (for example listener-level throttles and cache preallocation).
-func (mc *MinerConn) ApplyRuntimeConfig(cfg Config) {
-	if mc == nil {
-		return
-	}
-	mc.stateMu.Lock()
-	defer mc.stateMu.Unlock()
-
-	mc.cfg = cfg
-	mc.vardiff = buildVarDiffConfig(cfg)
-	mc.poolMask, mc.minVerBits = versionRollingPolicyFromConfig(cfg)
-	if cfg.MaxRecentJobs > 0 {
-		mc.maxRecentJobs = cfg.MaxRecentJobs
-	}
-
-	if cfg.ShareCheckDuplicate && mc.shareCache == nil {
-		capHint := mc.maxRecentJobs
-		if capHint <= 0 {
-			capHint = defaultRecentJobs
-		}
-		mc.shareCache = make(map[string]*duplicateShareSet, capHint)
-		mc.evictedShareCache = make(map[string]*evictedCacheEntry, capHint)
-	}
-	if cfg.ShareCheckNTimeWindow && mc.jobNTimeBounds == nil {
-		capHint := mc.maxRecentJobs
-		if capHint <= 0 {
-			capHint = defaultRecentJobs
-		}
-		mc.jobNTimeBounds = make(map[string]jobNTimeBounds, capHint)
-	}
-
-	curDiff := atomicLoadFloat64(&mc.difficulty)
-	clamped := mc.clampDifficulty(curDiff)
-	if clamped > 0 && clamped != curDiff {
-		atomicStoreFloat64(&mc.difficulty, clamped)
-		mc.shareTarget.Store(targetFromDifficulty(clamped))
-	}
 }
 
 func (mc *MinerConn) handle() {
@@ -475,13 +448,13 @@ func (mc *MinerConn) handleGetTransactions(req *StratumRequest) {
 
 	var job *Job
 	if jobID != "" {
-		j, _, _, _, _, _, ok := mc.jobForIDWithLast(jobID)
+		j, _, _, _, _, _, _, _, ok := mc.jobForIDWithLast(jobID)
 		if ok {
 			job = j
 		}
 	} else {
 		// No job id provided: use the last job notified to this connection when available.
-		_, last, _, _, _, _, _ := mc.jobForIDWithLast("")
+		_, last, _, _, _, _, _, _, _ := mc.jobForIDWithLast("")
 		if last != nil {
 			job = last
 		} else if mc.jobMgr != nil {
@@ -519,7 +492,12 @@ func (mc *MinerConn) scheduleInitialWork() {
 	}
 	mc.initialWorkScheduled = true
 	mc.initialWorkDue = time.Now().Add(defaultInitialDifficultyDelay)
+	due := mc.initialWorkDue
 	mc.initWorkMu.Unlock()
+
+	time.AfterFunc(time.Until(due), func() {
+		mc.maybeSendInitialWorkDue(time.Now())
+	})
 }
 
 func (mc *MinerConn) maybeSendInitialWork() {
@@ -593,7 +571,9 @@ func (mc *MinerConn) sendInitialWork() {
 			mc.setDifficulty(mc.startupPrimedDifficulty(diff))
 		}
 	}
-	mc.sendPendingStratumSetup()
+	if !mc.sendPendingStratumSetup() {
+		return
+	}
 
 	// First job always has clean_jobs=true so the miner starts fresh.
 	job := mc.jobMgr.CurrentJob()

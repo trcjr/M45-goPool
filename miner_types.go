@@ -93,8 +93,27 @@ type workerWalletState struct {
 }
 
 type notifiedCoinbaseParts struct {
-	coinb1 string
-	coinb2 string
+	coinb1               string
+	coinb2               string
+	worker               string
+	prefix               []byte
+	suffix               []byte
+	versionRollingActive bool
+	versionMask          uint32
+}
+
+// retiredJobBinding is the compact, block-only state retained after a job is
+// no longer eligible for ordinary share credit. The binary coinbase parts
+// already contain the connection's exact extranonce1 and advertised payout;
+// keeping the hex wire forms would only duplicate that data.
+type retiredJobBinding struct {
+	job                  *Job
+	worker               string
+	prefix               []byte
+	suffix               []byte
+	scriptTime           int64
+	versionRollingActive bool
+	versionMask          uint32
 }
 
 var defaultVarDiff = VarDiffConfig{
@@ -108,14 +127,19 @@ var defaultVarDiff = VarDiffConfig{
 }
 
 type MinerConn struct {
-	id                   string
-	ctx                  context.Context
-	conn                 net.Conn
-	writeMu              sync.Mutex
-	writeScratch         []byte
-	reader               *bufio.Reader
-	jobMgr               *JobManager
-	rpc                  rpcCaller
+	id           string
+	ctx          context.Context
+	conn         net.Conn
+	writeMu      sync.Mutex
+	notifyMu     sync.Mutex
+	versionMu    sync.Mutex
+	writeScratch []byte
+	reader       *bufio.Reader
+	jobMgr       *JobManager
+	rpc          rpcCaller
+	// cfg is the immutable policy negotiated for this miner session. Admin
+	// updates are applied to newly connected miners; advertised jobs carry any
+	// future-job policy that can safely change without rewriting session state.
 	cfg                  Config
 	extranonce1          []byte
 	extranonce1Hex       string
@@ -138,13 +162,18 @@ type MinerConn struct {
 	workerRegistry       *workerConnectionRegistry
 	savedWorkerStore     *workerListStore
 	discordNotifier      *discordNotifier
+	savedWorkerMu        sync.Mutex
 	savedWorkerTracked   bool
 	savedWorkerBestDiff  float64
+	savedWorkerSyncing   bool
+	savedWorkerSyncGen   uint64
 	registeredWorker     string
 	registeredWorkerHash string
 	jobMu                sync.Mutex
 	activeJobs           map[string]*Job
 	jobOrder             []string
+	retiredJobs          map[string]retiredJobBinding
+	retiredJobOrder      []string
 	maxRecentJobs        int
 	shareCache           map[string]*duplicateShareSet
 	evictedShareCache    map[string]*evictedCacheEntry
@@ -164,21 +193,30 @@ type MinerConn struct {
 	validSubsForBan      int
 	lastProtoViolation   time.Time
 	protoViolations      int
-	versionRoll          bool
-	versionMask          uint32
-	poolMask             uint32
-	minerMask            uint32
-	minVerBits           int
-	lastShareHash        string
-	lastShareAccepted    bool
-	lastShareDifficulty  float64
-	lastShareDetail      *ShareDetail
-	lastRejectReason     string
-	walletMu             sync.Mutex
-	workerWallets        map[string]workerWalletState
-	subscribed           bool
-	authorized           bool
-	cleanupOnce          sync.Once
+	// versionRoll records whether BIP310 version rolling was successfully
+	// negotiated for this connection. It remains true when versionMask is zero;
+	// a zero mask disables rolling bits without deactivating the extension.
+	versionRoll bool
+	versionMask uint32
+	poolMask    uint32
+	minerMask   uint32
+	minVerBits  int
+	// versionMaskHistory retains recently authoritative BIP310 masks so a
+	// delayed share can be reconstructed after one or more immediate
+	// mining.set_version_mask transitions. It is guarded by versionMu.
+	versionMaskHistory           []uint32
+	versionMaskHistoryOverflowed bool
+	lastShareHash                string
+	lastShareAccepted            bool
+	lastShareDifficulty          float64
+	lastShareDetail              *ShareDetail
+	lastRejectReason             string
+	walletMu                     sync.Mutex
+	workerWallets                map[string]workerWalletState
+	subscribed                   bool
+	authorized                   bool
+	cleanupOnce                  sync.Once
+	closed                       atomic.Bool
 	// If true, VarDiff adjustments are disabled for this miner and the
 	// current difficulty is treated as fixed (typically from suggest_difficulty).
 	lockDifficulty bool
@@ -292,7 +330,9 @@ type MinerConn struct {
 	initialWorkDue       time.Time
 	initialWorkSent      bool
 	pendingDifficulty    bool
-	pendingVersionMask   bool
+	// pendingVersionMask is protected by versionMu together with the rest of
+	// the connection's BIP310 state.
+	pendingVersionMask bool
 }
 
 type rpcCaller interface {

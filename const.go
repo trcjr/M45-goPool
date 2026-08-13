@@ -17,7 +17,7 @@ const (
 	defaultStatusTLSAddr     = ":443"
 	defaultStatusTagline     = "Solo Mining Pool"
 	defaultFiatCurrency      = "usd"
-	defaultGitHubURL         = "https://github.com/Distortions81/M45-Core-goPool/blob/main/README.md"
+	defaultGitHubURL         = "https://github.com/M45Core"
 	defaultMempoolAddressURL = "https://mempool.space/address/"
 	defaultStratumTLSListen  = ":4333"
 	defaultRPCURL            = "http://127.0.0.1:8332"
@@ -26,6 +26,7 @@ const (
 	defaultTemplateExtraNonce2Size = 8
 	defaultPoolFeePercent          = 2.0
 	defaultRecentJobs              = 10
+	maxVersionMaskRescueHistory    = 64
 	defaultConnectionTimeout       = 3 * time.Minute
 
 	// Accept rate limiting defaults.
@@ -39,9 +40,12 @@ const (
 	defaultAcceptSteadyStateReconnectWindow  = 60
 	defaultStratumMessagesPerMinute          = 0
 
-	defaultJobEntropy                = 4
-	maxJobEntropy                    = 16
-	defaultCoinbaseScriptSigMaxBytes = 100
+	defaultJobEntropy = 4
+	maxJobEntropy     = 16
+	// Consensus requires the coinbase input scriptSig to be 2..100 bytes.
+	minCoinbaseScriptSigBytes        = 2
+	maxCoinbaseScriptSigBytes        = 100
+	defaultCoinbaseScriptSigMaxBytes = maxCoinbaseScriptSigBytes
 
 	defaultMaxConns = 50000
 

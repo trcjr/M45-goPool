@@ -92,12 +92,15 @@ type submittedVersionResolution struct {
 
 // resolveSubmittedVersion prefers BIP310 replacement-bits semantics while
 // retaining a legacy XOR-delta alternate for miners that historically used it.
-func resolveSubmittedVersion(baseVersion, submittedVersion, versionMask uint32, allowMaskMismatch bool) submittedVersionResolution {
-	if submittedVersion == 0 {
+func resolveSubmittedVersion(baseVersion, submittedVersion, versionMask uint32, versionRollingActive, allowMaskMismatch, versionProvided bool) submittedVersionResolution {
+	if !versionProvided {
 		return submittedVersionResolution{useVersion: baseVersion}
 	}
 
-	if versionMask != 0 && submittedVersion&^versionMask == 0 {
+	// BIP310 replacement semantics also apply to an active zero mask. In that
+	// state the required explicit zero version_bits value preserves the complete
+	// job version.
+	if versionRollingActive && submittedVersion&^versionMask == 0 {
 		bip310Version := (baseVersion &^ versionMask) | (submittedVersion & versionMask)
 		xorVersion := baseVersion ^ submittedVersion
 		out := submittedVersionResolution{
@@ -129,6 +132,66 @@ func resolveSubmittedVersion(baseVersion, submittedVersion, versionMask uint32, 
 		useVersion:  submittedVersion,
 		versionDiff: fullVersionDiff,
 	}
+}
+
+type submittedVersionMaskPolicy struct {
+	active bool
+	mask   uint32
+}
+
+// blockOnlyRescueVersions returns every retained plausible supplied-version
+// header not already covered by ordinary-share primary/alternate resolution.
+// In addition to current and notify-time BIP310 replacement semantics, a miner
+// can have used an intermediate connection-wide mask, a complete header
+// version, or a legacy XOR delta. The common four-interpretation case stays in
+// the inline array; retained intermediate masks spill into the extra slice.
+func blockOnlyRescueVersions(
+	baseVersion, submittedVersion uint32,
+	ordinary submittedVersionResolution,
+	current submittedVersionMaskPolicy,
+	notified *submittedVersionMaskPolicy,
+	historicalMasks []uint32,
+) ([3]uint32, []uint32, int) {
+	var versions [3]uint32
+	var extra []uint32
+	var count int
+	candidateAt := func(index int) uint32 {
+		if index < len(versions) {
+			return versions[index]
+		}
+		return extra[index-len(versions)]
+	}
+	appendCandidate := func(candidate uint32) {
+		if candidate == ordinary.useVersion || (ordinary.hasAlternateVersion && candidate == ordinary.alternateUseVersion) {
+			return
+		}
+		for i := 0; i < count; i++ {
+			if candidateAt(i) == candidate {
+				return
+			}
+		}
+		if count < len(versions) {
+			versions[count] = candidate
+		} else {
+			extra = append(extra, candidate)
+		}
+		count++
+	}
+
+	if current.active {
+		appendCandidate((baseVersion &^ current.mask) | (submittedVersion & current.mask))
+	}
+	if notified != nil && notified.active &&
+		(notified.active != current.active || notified.mask != current.mask) {
+		appendCandidate((baseVersion &^ notified.mask) | (submittedVersion & notified.mask))
+	}
+	for _, mask := range historicalMasks {
+		appendCandidate((baseVersion &^ mask) | (submittedVersion & mask))
+	}
+	appendCandidate(submittedVersion)
+	appendCandidate(baseVersion ^ submittedVersion)
+
+	return versions, extra, count
 }
 
 // parseSubmitParams validates and extracts the core fields from a mining.submit
@@ -206,7 +269,9 @@ func (mc *MinerConn) parseSubmitParams(req *StratumRequest, now time.Time) (subm
 	}
 
 	submittedVersion := uint32(0)
+	versionProvided := false
 	if len(req.Params) == 6 {
+		versionProvided = true
 		verStr, ok := req.Params[5].(string)
 		if !ok {
 			mc.recordShare(worker, false, 0, 0, "invalid version", "", nil, now)
@@ -242,6 +307,7 @@ func (mc *MinerConn) parseSubmitParams(req *StratumRequest, now time.Time) (subm
 	out.ntime = ntime
 	out.nonce = nonce
 	out.submittedVersion = submittedVersion
+	out.versionProvided = versionProvided
 	return out, true
 }
 
@@ -267,6 +333,7 @@ func (mc *MinerConn) prepareSubmissionTaskFromParsed(reqID any, params submitPar
 	ntime := params.ntime
 	nonce := params.nonce
 	submittedVersion := params.submittedVersion
+	versionProvided := params.versionProvided
 	validateFields := mc.cfg.ShareCheckParamFormat
 
 	if mc.cfg.ShareRequireAuthorizedConnection && !mc.authorized {
@@ -281,31 +348,33 @@ func (mc *MinerConn) prepareSubmissionTaskFromParsed(reqID any, params submitPar
 
 	authorizedWorker := mc.currentWorker()
 	submitWorker := worker
-	if mc.cfg.ShareRequireAuthorizedConnection && mc.cfg.ShareRequireWorkerMatch && authorizedWorker != "" && submitWorker != authorizedWorker {
-		logger.Warn("submit rejected: worker mismatch", "remote", mc.id, "authorized", authorizedWorker, "submitted", submitWorker)
-		mc.recordShare(authorizedWorker, false, 0, 0, "unauthorized worker", "", nil, now)
-		if mc.metrics != nil {
-			mc.metrics.RecordSubmitError("worker_mismatch")
-		}
-		mc.writeResponse(StratumResponse{ID: reqID, Result: false, Error: newStratumError(stratumErrCodeUnauthorized, "unauthorized")})
-		return submissionTask{}, false
-	}
-
 	workerName := authorizedWorker
 	if workerName == "" {
 		workerName = worker
 	}
-	if mc.isBanned(now) {
-		until, reason, _ := mc.banDetails()
-		logger.Warn("submit rejected: banned", "miner", mc.minerName(workerName), "ban_until", until, "reason", reason)
-		if mc.metrics != nil {
-			mc.metrics.RecordSubmitError("banned")
+	var banPolicy *bannedSubmitPolicy
+	if until, reason, _ := mc.banDetails(); now.Before(until) {
+		banPolicy = &bannedSubmitPolicy{
+			until:  until,
+			reason: reason,
+			err:    mc.bannedStratumError(),
 		}
-		mc.writeResponse(StratumResponse{ID: reqID, Result: false, Error: mc.bannedStratumError()})
-		return submissionTask{}, false
 	}
 
-	job, curLast, curPrevHash, curHeight, ntimeBounds, notifiedScriptTime, ok := mc.jobForIDWithLast(jobID)
+	jobLookup := mc.jobForSubmissionWithLast(jobID)
+	job := jobLookup.job
+	curLast := jobLookup.lastJob
+	curPrevHash := jobLookup.lastPrevHash
+	curHeight := jobLookup.lastHeight
+	ntimeBounds := jobLookup.ntimeBounds
+	notifiedScriptTime := jobLookup.scriptTime
+	notifiedCoinbase := jobLookup.coinbase
+	coinbaseOK := jobLookup.coinbaseOK
+	ok := jobLookup.found
+	retiredJob := jobLookup.retired
+	if coinbaseOK && notifiedCoinbase.worker != "" {
+		workerName = notifiedCoinbase.worker
+	}
 	usedFallbackJob := false
 	if !ok || job == nil {
 		if shareJobFreshnessChecksJobID(mc.cfg.ShareJobFreshnessMode) {
@@ -329,14 +398,32 @@ func (mc *MinerConn) prepareSubmissionTaskFromParsed(reqID any, params submitPar
 	// Defensive: ensure the job template still matches what we advertised to this
 	// connection (prevhash/height). If it changed underneath us, reject as stale.
 	policyReject := submitPolicyReject{reason: rejectUnknown}
-	if usedFallbackJob {
+	if usedFallbackJob || retiredJob {
 		// Even when job-id freshness checks are disabled, classify non-block
-		// shares for unknown/expired job IDs as stale rather than lowdiff.
+		// shares for unknown/expired and retired job IDs as stale rather than
+		// lowdiff. Retired jobs continue through PoW validation solely so a real
+		// network-target block can be submitted exactly as advertised.
 		policyReject = submitPolicyReject{reason: rejectStaleJob, errCode: stratumErrCodeJobNotFound, errMsg: "job not found"}
 	}
 	if shareJobFreshnessChecksPrevhash(mc.cfg.ShareJobFreshnessMode) && curLast != nil && (curPrevHash != job.Template.Previous || curHeight != job.Template.Height) {
 		logger.Warn("submit: stale job mismatch (policy)", "remote", mc.id, "job", jobID, "expected_prev", job.Template.Previous, "expected_height", job.Template.Height, "current_prev", curPrevHash, "current_height", curHeight)
 		policyReject = submitPolicyReject{reason: rejectStaleJob, errCode: stratumErrCodeJobNotFound, errMsg: "job not found"}
+	}
+	if mc.cfg.ShareRequireAuthorizedConnection && mc.cfg.ShareRequireWorkerMatch && workerName != "" && submitWorker != workerName {
+		logger.Warn("submit worker mismatch (policy)",
+			"remote", mc.id,
+			"job", jobID,
+			"expected", workerName,
+			"submitted", submitWorker,
+		)
+		if mc.metrics != nil {
+			mc.metrics.RecordSubmitError("worker_mismatch")
+		}
+		if policyReject.reason == rejectUnknown {
+			// Keep validating PoW so a real block is never discarded solely for
+			// a worker-label policy mismatch.
+			policyReject = submitPolicyReject{reason: rejectUnauthorizedWorker, errCode: stratumErrCodeUnauthorized, errMsg: "unauthorized"}
+		}
 	}
 
 	extranonce2, err := normalizeSubmitExtranonce2Hex(extranonce2, job.Extranonce2Size)
@@ -369,7 +456,7 @@ func (mc *MinerConn) prepareSubmissionTaskFromParsed(reqID any, params submitPar
 	// distance from the template.
 	minNTime := ntimeBounds.min
 	maxNTime := ntimeBounds.max
-	if mc.cfg.ShareCheckNTimeWindow && (int64(ntimeVal) < minNTime || int64(ntimeVal) > maxNTime) {
+	if !retiredJob && mc.cfg.ShareCheckNTimeWindow && (int64(ntimeVal) < minNTime || int64(ntimeVal) > maxNTime) {
 		// Policy-only: for safety we still run the PoW check and, if the share is
 		// a real block, submit it even if ntime violates the pool's tighter window.
 		logger.Warn("submit ntime outside window (policy)", "remote", mc.id, "ntime", ntimeVal, "min", minNTime, "max", maxNTime)
@@ -394,16 +481,63 @@ func (mc *MinerConn) prepareSubmissionTaskFromParsed(reqID any, params submitPar
 
 	// BIP320: reject version rolls outside the negotiated mask (docs/protocols/bip-0320.mediawiki).
 	baseVersion := uint32(job.Template.Version)
-	versionResolution := resolveSubmittedVersion(baseVersion, submittedVersion, mc.versionMask, mc.cfg.ShareAllowOutOfMaskVersionBits)
+	// sendNotifyFor updates the connection-wide mask before writing
+	// mining.set_version_mask. Synchronize with that wire sequence so a submit
+	// cannot observe the new mask until the miner could have received it.
+	mc.notifyMu.Lock()
+	var versionMaskHistoryBuffer [defaultRecentJobs]uint32
+	versionRollingActive, versionMask, versionMaskHistory := mc.versionRollingPolicyHistorySnapshot(versionMaskHistoryBuffer[:0])
+	mc.notifyMu.Unlock()
+	versionResolution := resolveSubmittedVersion(baseVersion, submittedVersion, versionMask, versionRollingActive, mc.cfg.ShareAllowOutOfMaskVersionBits, versionProvided)
 	useVersion := versionResolution.useVersion
 	versionDiff := versionResolution.versionDiff
+	var blockRescueVersions [3]uint32
+	var blockRescueExtra []uint32
+	var blockRescueCount int
+	if versionProvided {
+		currentPolicy := submittedVersionMaskPolicy{active: versionRollingActive, mask: versionMask}
+		var notifiedPolicy *submittedVersionMaskPolicy
+		if coinbaseOK && notifiedCoinbase.versionRollingActive &&
+			(notifiedCoinbase.versionMask != versionMask || notifiedCoinbase.versionRollingActive != versionRollingActive) {
+			notifiedPolicy = &submittedVersionMaskPolicy{
+				active: notifiedCoinbase.versionRollingActive,
+				mask:   notifiedCoinbase.versionMask,
+			}
+		}
+		blockRescueVersions, blockRescueExtra, blockRescueCount = blockOnlyRescueVersions(
+			baseVersion,
+			submittedVersion,
+			versionResolution,
+			currentPolicy,
+			notifiedPolicy,
+			versionMaskHistory,
+		)
+	}
 
 	versionHex := ""
 	if debugLogging || verboseRuntimeLogging {
 		versionHex = uint32ToHex8Lower(useVersion)
 	}
+	// Preserve the existing full-version compatibility path for nonzero masks.
+	// At an active zero mask, though, BIP310 requires the explicit value to be
+	// zero; comparing only the resolved version diff would miss a full job
+	// version supplied in the version_bits slot.
+	rawVersionMaskMismatch := versionRollingActive && versionMask == 0 && versionProvided && submittedVersion != 0
+	if mc.cfg.ShareCheckVersionRolling && rawVersionMaskMismatch {
+		if !mc.cfg.ShareAllowOutOfMaskVersionBits {
+			logger.Warn("submit version bits outside mask (policy)", "remote", mc.id, "version_bits", uint32ToHex8Lower(submittedVersion), "mask", uint32ToHex8Lower(versionMask))
+			if policyReject.reason == rejectUnknown {
+				policyReject = submitPolicyReject{reason: rejectInvalidVersionMask, errCode: stratumErrCodeInvalidRequest, errMsg: "invalid version mask"}
+			}
+		} else {
+			logger.Debug("submit version bits outside mask allowed (compat)",
+				"remote", mc.id,
+				"version_bits", uint32ToHex8Lower(submittedVersion),
+				"mask", uint32ToHex8Lower(versionMask))
+		}
+	}
 	if mc.cfg.ShareCheckVersionRolling && versionDiff != 0 {
-		if !mc.versionRoll {
+		if !versionRollingActive {
 			if !mc.cfg.ShareAllowOutOfMaskVersionBits {
 				logger.Warn("submit version rolling disabled (policy)", "remote", mc.id, "diff", uint32ToHex8Lower(versionDiff))
 				if policyReject.reason == rejectUnknown {
@@ -416,9 +550,9 @@ func (mc *MinerConn) prepareSubmissionTaskFromParsed(reqID any, params submitPar
 			}
 		}
 
-		if versionDiff&^mc.versionMask != 0 {
+		if !rawVersionMaskMismatch && versionDiff&^versionMask != 0 {
 			if !mc.cfg.ShareAllowOutOfMaskVersionBits {
-				logger.Warn("submit version outside mask (policy)", "remote", mc.id, "version", uint32ToHex8Lower(useVersion), "mask", uint32ToHex8Lower(mc.versionMask))
+				logger.Warn("submit version outside mask (policy)", "remote", mc.id, "version", uint32ToHex8Lower(useVersion), "mask", uint32ToHex8Lower(versionMask))
 				if policyReject.reason == rejectUnknown {
 					policyReject = submitPolicyReject{reason: rejectInvalidVersionMask, errCode: stratumErrCodeInvalidRequest, errMsg: "invalid version mask"}
 				}
@@ -426,7 +560,7 @@ func (mc *MinerConn) prepareSubmissionTaskFromParsed(reqID any, params submitPar
 				logger.Debug("submit version outside mask allowed (compat)",
 					"remote", mc.id,
 					"version", uint32ToHex8Lower(useVersion),
-					"mask", uint32ToHex8Lower(mc.versionMask))
+					"mask", uint32ToHex8Lower(versionMask))
 			}
 		}
 	}
@@ -450,9 +584,15 @@ func (mc *MinerConn) prepareSubmissionTaskFromParsed(reqID any, params submitPar
 		alternateVersionHex: uint32ToHex8Lower(versionResolution.alternateUseVersion),
 		alternateUseVersion: versionResolution.alternateUseVersion,
 		hasAlternateVersion: versionResolution.hasAlternateVersion,
+		blockRescueVersions: blockRescueVersions,
+		blockRescueExtra:    blockRescueExtra,
+		blockRescueCount:    blockRescueCount,
+		notifiedCoinbase:    notifiedCoinbase,
+		hasNotifiedCoinbase: coinbaseOK && len(notifiedCoinbase.prefix) > 0 && len(notifiedCoinbase.suffix) > 0,
 		scriptTime:          notifiedScriptTime,
 		assignedDifficulty:  mc.assignedDifficulty(jobID),
 		policyReject:        policyReject,
+		banPolicy:           banPolicy,
 		receivedAt:          now,
 	}
 	return task, true

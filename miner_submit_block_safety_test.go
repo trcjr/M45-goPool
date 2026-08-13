@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/btcsuite/btcd/btcutil"
 )
 
 type countingSubmitRPC struct {
@@ -333,14 +335,127 @@ func TestBlockBypassesPolicyRejects(t *testing.T) {
 	}
 }
 
-func TestSubmitBlockMatchesNotifyPayload(t *testing.T) {
-	mc, notifyConn := minerConnForNotifyTest(t)
+func TestBannedMinerBlockBypassesBanPolicy(t *testing.T) {
+	mc, job := newSubmitReadyMinerConnForModesTest(t)
 	mc.cfg.DataDir = t.TempDir()
-	mc.cfg.SubmitProcessInline = true
+	mc.cfg.ShareCheckDuplicate = false
 	rpc := &countingSubmitRPC{}
 	mc.rpc = rpc
+	job.Target = new(big.Int).Set(maxUint256)
+	wallet, payoutScript := generateTestWallet(t)
+	mc.setWorkerWallet(mc.currentWorker(), wallet, payoutScript)
+	if script := mc.singlePayoutScript(job, mc.currentWorker()); len(script) == 0 {
+		t.Fatalf("missing payout script for current worker")
+	}
+
+	now := time.Unix(job.Template.CurTime, 0)
+	mc.stateMu.Lock()
+	mc.banUntil = now.Add(time.Hour)
+	mc.banReason = "test ban"
+	mc.invalidSubs = 3
+	mc.stateMu.Unlock()
+
+	conn := &recordConn{}
+	mc.conn = conn
+	task, ok := mc.prepareSubmissionTask(testSubmitRequestForJob(job, mc.currentWorker()), now)
+	if !ok {
+		t.Fatalf("banned miner's advertised work was rejected before PoW")
+	}
+	if task.banPolicy == nil {
+		t.Fatalf("submission task did not preserve receipt-time ban state")
+	}
+	if out := conn.String(); out != "" {
+		t.Fatalf("banned block candidate was rejected before PoW: %q", out)
+	}
+
+	mc.processSubmissionTask(task)
+	flushFoundBlockLog(t)
+
+	if got := rpc.submitCalls.Load(); got != 1 {
+		t.Fatalf("submitblock calls = %d, want 1", got)
+	}
+	mc.metrics.mu.Lock()
+	shareErrors := mc.metrics.shareErrorCount
+	mc.metrics.mu.Unlock()
+	if shareErrors != 0 {
+		t.Fatalf("found block recorded %d banned submit errors, want 0", shareErrors)
+	}
+}
+
+func TestBannedMinerNonBlockRejectedWithoutPenalty(t *testing.T) {
+	mc, job := newSubmitReadyMinerConnForModesTest(t)
+	mc.cfg.ShareCheckDuplicate = false
+	rpc := &countingSubmitRPC{}
+	mc.rpc = rpc
+	job.Target = new(big.Int)
+	wallet, payoutScript := generateTestWallet(t)
+	mc.setWorkerWallet(mc.currentWorker(), wallet, payoutScript)
+	if script := mc.singlePayoutScript(job, mc.currentWorker()); len(script) == 0 {
+		t.Fatalf("missing payout script for current worker")
+	}
+
+	now := time.Unix(job.Template.CurTime, 0)
+	const initialInvalidSubs = 3
+	const initialValidSubs = 7
+	mc.stateMu.Lock()
+	mc.banUntil = now.Add(time.Hour)
+	mc.banReason = "test ban"
+	mc.invalidSubs = initialInvalidSubs
+	mc.validSubsForBan = initialValidSubs
+	mc.stateMu.Unlock()
+
+	conn := &recordConn{}
+	mc.conn = conn
+	task, ok := mc.prepareSubmissionTask(testSubmitRequestForJob(job, mc.currentWorker()), now)
+	if !ok {
+		t.Fatalf("banned miner's advertised work was rejected before PoW")
+	}
+	mc.processSubmissionTask(task)
+
+	if got := rpc.submitCalls.Load(); got != 0 {
+		t.Fatalf("submitblock calls = %d, want 0", got)
+	}
+	if out := conn.String(); !strings.Contains(out, "banned") {
+		t.Fatalf("expected banned response, got %q", out)
+	}
+	mc.stateMu.Lock()
+	invalidSubs := mc.invalidSubs
+	validSubs := mc.validSubsForBan
+	mc.stateMu.Unlock()
+	if invalidSubs != initialInvalidSubs {
+		t.Fatalf("invalid submission count = %d, want %d", invalidSubs, initialInvalidSubs)
+	}
+	if validSubs != initialValidSubs {
+		t.Fatalf("valid submission count = %d, want %d", validSubs, initialValidSubs)
+	}
+	mc.metrics.mu.Lock()
+	shareErrors := mc.metrics.shareErrorCount
+	mc.metrics.mu.Unlock()
+	if shareErrors != 1 {
+		t.Fatalf("banned non-block recorded %d submit errors, want 1", shareErrors)
+	}
+}
+
+func TestSubmitBlockMatchesNotifyPayload(t *testing.T) {
+	mc, notifyConn := minerConnForNotifyTest(t)
+	mc.maxRecentJobs = 1
+	mc.cfg.DataDir = t.TempDir()
+	setupTestStateDB(t, mc.cfg.DataDir)
+	mc.cfg.SubmitProcessInline = true
+	mc.cfg.ShareRequireAuthorizedConnection = true
+	mc.cfg.ShareRequireWorkerMatch = true
+	mc.cfg.ShareJobFreshnessMode = shareJobFreshnessJobID
+	mc.cfg.ShareCheckParamFormat = true
+	rpc := &countingSubmitRPC{}
+	mc.rpc = rpc
+	workerA := mc.currentWorker()
+	walletA, _, ok := mc.workerWalletData(workerA)
+	if !ok {
+		t.Fatalf("missing wallet A data")
+	}
 
 	job := benchmarkSubmitJobForTest(t)
+	job.Generation = 1
 	job.Target = new(big.Int).Set(maxUint256)
 	const rawTxHex = "0100000001" +
 		"0000000000000000000000000000000000000000000000000000000000000000" +
@@ -349,9 +464,12 @@ func TestSubmitBlockMatchesNotifyPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode raw tx: %v", err)
 	}
-	txid := reverseBytes(doubleSHA256(rawTx))
-	job.MerkleBranches = buildMerkleBranches([][]byte{txid})
-	job.Transactions = []GBTTransaction{{Data: rawTxHex, Txid: hex.EncodeToString(txid)}}
+	parsedTx, err := btcutil.NewTxFromBytes(rawTx)
+	if err != nil {
+		t.Fatalf("parse raw tx: %v", err)
+	}
+	job.MerkleBranches = buildMerkleBranches([]*btcutil.Tx{parsedTx})
+	job.Transactions = []GBTTransaction{{Data: rawTxHex, Txid: parsedTx.Hash().String()}}
 
 	mc.sendNotifyFor(job, true)
 	notifies := notifyMessagesFromOutput(t, notifyConn.String())
@@ -398,10 +516,42 @@ func TestSubmitBlockMatchesNotifyPayload(t *testing.T) {
 		t.Fatalf("build expected header: %v", err)
 	}
 
+	// Reauthorize the connection to wallet B after wallet A's work was sent.
+	// Also overwrite A's live cache entry so only the immutable advertised
+	// coinbase can reproduce the solved block.
+	workerB, walletB, scriptB := generateTestWorker(t)
+	mc.setWorkerWallet(workerB, walletB, scriptB)
+	mc.handleAuthorizeID(2, workerB, "")
+	mc.setWorkerWallet(workerA, walletA, scriptB)
+
+	// Publish a newer competing branch after reauthorization. With a one-job
+	// active window this retires wallet A's exact advertised binding; a winning
+	// block on that displaced branch must still be reconstructed from A's notify.
+	reorg := *job
+	reorg.JobID = "wallet-b-reorg"
+	reorg.Generation = 2
+	reorg.Template.Previous = strings.Repeat("22", 32)
+	reorg.PrevHash = reorg.Template.Previous
+	reorg.Template.Height--
+	reorg.Target = new(big.Int)
+	reorg.targetBE = [32]byte{}
+	mc.sendNotifyFor(&reorg, true)
+	mc.jobMu.Lock()
+	_, oldActive := mc.activeJobs[stratumJobID]
+	retired, oldRetired := mc.retiredJobs[stratumJobID]
+	mc.jobMu.Unlock()
+	if oldActive || !oldRetired || retired.job != job || retired.worker != workerA {
+		t.Fatalf("old wallet binding state: active=%v retired=%v job_match=%v worker=%q",
+			oldActive, oldRetired, retired.job == job, retired.worker)
+	}
+
 	mc.handleSubmit(&StratumRequest{
 		ID:     1,
 		Method: "mining.submit",
-		Params: []any{mc.currentWorker(), stratumJobID, en2Hex, ntimeHex, nonceHex},
+		// The label says B, but this retained job was advertised for A. Strict
+		// worker policy must not suppress a network-target block, and payout and
+		// attribution must remain bound to A.
+		Params: []any{workerB, stratumJobID, en2Hex, ntimeHex, nonceHex},
 	})
 	flushFoundBlockLog(t)
 
@@ -427,6 +577,13 @@ func TestSubmitBlockMatchesNotifyPayload(t *testing.T) {
 	expectedPayload.Write(rawTx)
 	if !bytes.Equal(blockBytes[80:], expectedPayload.Bytes()) {
 		t.Fatalf("submitted block payload does not match notify coinbase plus job transactions")
+	}
+	if got := mc.currentWorker(); got != workerB {
+		t.Fatalf("late wallet A block changed current worker to %q, want wallet B %q", got, workerB)
+	}
+	found := readLastFoundBlockRecord(t, mc.cfg.DataDir)
+	if got, _ := found["worker"].(string); got != workerA {
+		t.Fatalf("found block worker = %q, want advertised wallet A %q", got, workerA)
 	}
 }
 

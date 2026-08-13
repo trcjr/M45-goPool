@@ -3,6 +3,7 @@ data/*.pem
 data/*.toml
 data/config/*.toml
 data/config/*.toml.bak
+data/certbot-webroot/
 data/state/
 data/logs/
 
@@ -16,4 +17,6 @@ documentation/reference-miners/
 documentation/sv2-apps
 documentation/sv2-spec
 vendor/
-
+.benchmarks/
+reports/open-pool-benchmark/
+reports/go-benchmarks/

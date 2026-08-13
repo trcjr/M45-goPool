@@ -71,6 +71,7 @@ const (
 	rejectInvalidVersionMask
 	rejectInsufficientVersionBits
 	rejectStaleJob
+	rejectUnauthorizedWorker
 	rejectDuplicateShare
 	rejectLowDiff
 )
@@ -95,6 +96,8 @@ func (r submitRejectReason) String() string {
 		return "insufficient version bits"
 	case rejectStaleJob:
 		return "stale job"
+	case rejectUnauthorizedWorker:
+		return "unauthorized worker"
 	case rejectDuplicateShare:
 		return "duplicate share"
 	case rejectLowDiff:
@@ -621,6 +624,9 @@ func (mc *MinerConn) trackJob(job *Job, stratumJobID string, clean bool) {
 	}
 	mc.jobMu.Lock()
 	defer mc.jobMu.Unlock()
+	// Stratum notify IDs are unique for a connection, but clear a retired
+	// collision defensively so a reused ID can never resolve to older work.
+	mc.removeRetiredJobLocked(stratumJobID)
 	// No longer clear old jobs on clean - preserve them for miners with latency
 	// The eviction logic below will handle cleanup when we exceed maxRecentJobs
 	if _, ok := mc.activeJobs[stratumJobID]; !ok {
@@ -655,6 +661,7 @@ func (mc *MinerConn) trackJob(job *Job, stratumJobID string, clean bool) {
 	for len(mc.jobOrder) > mc.maxRecentJobs && len(mc.jobOrder) > 0 {
 		oldest := mc.jobOrder[0]
 		mc.jobOrder = mc.jobOrder[1:]
+		mc.retireJobLocked(oldest)
 		delete(mc.activeJobs, oldest)
 		if mc.jobScriptTime != nil {
 			delete(mc.jobScriptTime, oldest)
@@ -696,6 +703,127 @@ func (mc *MinerConn) trackJob(job *Job, stratumJobID string, clean bool) {
 	}
 }
 
+// retireJobLocked preserves only the immutable data needed to reconstruct and
+// submit a network-target block. Ordinary share policy state is deliberately
+// discarded by trackJob after this returns. mc.jobMu must be held by callers.
+func (mc *MinerConn) retireJobLocked(jobID string) {
+	job := mc.activeJobs[jobID]
+	coinbase, coinbaseOK := mc.jobNotifyCoinbase[jobID]
+	// scriptTime is useful attribution metadata, but the exact binary coinbase
+	// is sufficient for block reconstruction when older/test state lacks it.
+	scriptTime := mc.jobScriptTime[jobID]
+	if job == nil || !coinbaseOK || len(coinbase.prefix) == 0 || len(coinbase.suffix) == 0 {
+		return
+	}
+	if mc.retiredJobs == nil {
+		mc.retiredJobs = make(map[string]retiredJobBinding, mc.maxRecentJobs)
+	}
+	if _, exists := mc.retiredJobs[jobID]; !exists {
+		mc.retiredJobOrder = append(mc.retiredJobOrder, jobID)
+	}
+	mc.retiredJobs[jobID] = retiredJobBinding{
+		job:                  job,
+		worker:               coinbase.worker,
+		prefix:               coinbase.prefix,
+		suffix:               coinbase.suffix,
+		scriptTime:           scriptTime,
+		versionRollingActive: coinbase.versionRollingActive,
+		versionMask:          coinbase.versionMask,
+	}
+
+	for len(mc.retiredJobOrder) > mc.maxRecentJobs && len(mc.retiredJobOrder) > 0 {
+		oldest := mc.retiredJobOrder[0]
+		mc.retiredJobOrder = mc.retiredJobOrder[1:]
+		delete(mc.retiredJobs, oldest)
+	}
+}
+
+// removeRetiredJobLocked removes both lookup and FIFO state for a job ID.
+// mc.jobMu must be held by callers.
+func (mc *MinerConn) removeRetiredJobLocked(jobID string) {
+	if _, ok := mc.retiredJobs[jobID]; !ok {
+		return
+	}
+	delete(mc.retiredJobs, jobID)
+	for i, id := range mc.retiredJobOrder {
+		if id != jobID {
+			continue
+		}
+		copy(mc.retiredJobOrder[i:], mc.retiredJobOrder[i+1:])
+		mc.retiredJobOrder = mc.retiredJobOrder[:len(mc.retiredJobOrder)-1]
+		return
+	}
+}
+
+type submissionJobLookup struct {
+	job          *Job
+	lastJob      *Job
+	lastPrevHash string
+	lastHeight   int64
+	ntimeBounds  jobNTimeBounds
+	scriptTime   int64
+	coinbase     notifiedCoinbaseParts
+	coinbaseOK   bool
+	found        bool
+	retired      bool
+}
+
+// jobForSubmissionWithLast distinguishes an active job from an exact
+// block-only retired binding. Missing IDs retain the existing last-job fallback
+// metadata for compatibility when freshness checks are disabled.
+func (mc *MinerConn) jobForSubmissionWithLast(jobID string) submissionJobLookup {
+	mc.jobMu.Lock()
+	defer mc.jobMu.Unlock()
+
+	lookup := submissionJobLookup{
+		lastJob:      mc.lastJob,
+		lastPrevHash: mc.lastJobPrevHash,
+		lastHeight:   mc.lastJobHeight,
+	}
+	if job := mc.activeJobs[jobID]; job != nil {
+		lookup.job = job
+		lookup.found = true
+		if mc.jobNotifyCoinbase != nil {
+			lookup.coinbase, lookup.coinbaseOK = mc.jobNotifyCoinbase[jobID]
+		}
+		if mc.cfg.ShareCheckNTimeWindow && mc.jobNTimeBounds != nil {
+			lookup.ntimeBounds = mc.jobNTimeBounds[jobID]
+		}
+		if mc.jobScriptTime != nil {
+			lookup.scriptTime = mc.jobScriptTime[jobID]
+		}
+		return lookup
+	}
+	if retired, ok := mc.retiredJobs[jobID]; ok && retired.job != nil {
+		lookup.job = retired.job
+		lookup.found = true
+		lookup.retired = true
+		lookup.scriptTime = retired.scriptTime
+		lookup.coinbase = notifiedCoinbaseParts{
+			worker:               retired.worker,
+			prefix:               retired.prefix,
+			suffix:               retired.suffix,
+			versionRollingActive: retired.versionRollingActive,
+			versionMask:          retired.versionMask,
+		}
+		lookup.coinbaseOK = len(retired.prefix) > 0 && len(retired.suffix) > 0
+		return lookup
+	}
+
+	if mc.lastJobID != "" {
+		if mc.jobNotifyCoinbase != nil {
+			lookup.coinbase, lookup.coinbaseOK = mc.jobNotifyCoinbase[mc.lastJobID]
+		}
+		if mc.cfg.ShareCheckNTimeWindow && mc.jobNTimeBounds != nil {
+			lookup.ntimeBounds = mc.jobNTimeBounds[mc.lastJobID]
+		}
+		if mc.jobScriptTime != nil {
+			lookup.scriptTime = mc.jobScriptTime[mc.lastJobID]
+		}
+	}
+	return lookup
+}
+
 func (mc *MinerConn) scriptTimeForJob(jobID string, fallback int64) int64 {
 	if jobID == "" {
 		return fallback
@@ -712,10 +840,13 @@ func (mc *MinerConn) scriptTimeForJob(jobID string, fallback int64) int64 {
 // jobForIDWithLast returns the job for the given ID along with the current lastJob
 // and the scriptTime used when this job was notified to this connection, all
 // under a single lock acquisition to avoid race conditions.
-func (mc *MinerConn) jobForIDWithLast(jobID string) (job *Job, lastJob *Job, lastPrevHash string, lastHeight int64, ntimeBounds jobNTimeBounds, scriptTime int64, ok bool) {
+func (mc *MinerConn) jobForIDWithLast(jobID string) (job *Job, lastJob *Job, lastPrevHash string, lastHeight int64, ntimeBounds jobNTimeBounds, scriptTime int64, coinbase notifiedCoinbaseParts, coinbaseOK bool, ok bool) {
 	mc.jobMu.Lock()
 	defer mc.jobMu.Unlock()
 	job, ok = mc.activeJobs[jobID]
+	if mc.jobNotifyCoinbase != nil {
+		coinbase, coinbaseOK = mc.jobNotifyCoinbase[jobID]
+	}
 	if mc.cfg.ShareCheckNTimeWindow && mc.jobNTimeBounds != nil {
 		ntimeBounds = mc.jobNTimeBounds[jobID]
 	}
@@ -723,6 +854,9 @@ func (mc *MinerConn) jobForIDWithLast(jobID string) (job *Job, lastJob *Job, las
 		scriptTime = mc.jobScriptTime[jobID]
 	}
 	if !ok && mc.lastJobID != "" {
+		if mc.jobNotifyCoinbase != nil {
+			coinbase, coinbaseOK = mc.jobNotifyCoinbase[mc.lastJobID]
+		}
 		if mc.cfg.ShareCheckNTimeWindow && mc.jobNTimeBounds != nil {
 			ntimeBounds = mc.jobNTimeBounds[mc.lastJobID]
 		}
@@ -730,7 +864,7 @@ func (mc *MinerConn) jobForIDWithLast(jobID string) (job *Job, lastJob *Job, las
 			scriptTime = mc.jobScriptTime[mc.lastJobID]
 		}
 	}
-	return job, mc.lastJob, mc.lastJobPrevHash, mc.lastJobHeight, ntimeBounds, scriptTime, ok
+	return job, mc.lastJob, mc.lastJobPrevHash, mc.lastJobHeight, ntimeBounds, scriptTime, coinbase, coinbaseOK, ok
 }
 
 func (mc *MinerConn) setJobDifficulty(jobID string, diff float64) {
@@ -784,7 +918,7 @@ func (mc *MinerConn) cleanFlagFor(job *Job) bool {
 	if mc.lastJob == nil {
 		return true
 	}
-	return mc.lastJobPrevHash != job.Template.Previous || mc.lastJobHeight != job.Template.Height
+	return miningTemplateRequiresClean(mc.lastJob.Template, mc.lastJob.VersionMask, job.Template, job.VersionMask)
 }
 
 func (mc *MinerConn) isDuplicateShare(jobID string, extranonce2 []byte, ntime, nonce uint32, version uint32) bool {
@@ -934,17 +1068,7 @@ func (mc *MinerConn) suggestedVardiff(now time.Time, snap minerShareSnapshot) fl
 
 	rollingHashrate := snap.RollingHashrate
 	if rollingHashrate <= 0 {
-		if windowStart.IsZero() || !now.After(windowStart) || windowDifficulty <= 0 {
-			return currentDiff
-		}
-		windowSeconds := now.Sub(windowStart).Seconds()
-		if windowSeconds <= 0 {
-			return currentDiff
-		}
-		rollingHashrate = (windowDifficulty * hashPerShare) / windowSeconds
-		if rollingHashrate <= 0 {
-			return currentDiff
-		}
+		return currentDiff
 	}
 
 	interval := mc.vardiffRetargetInterval(rollingHashrate, currentDiff, targetShares, snap.RecentStaleRate)
@@ -1441,10 +1565,13 @@ func (mc *MinerConn) setDifficulty(diff float64) {
 	mc.sendDifficultyNotification(diff)
 }
 
-func (mc *MinerConn) sendDifficultyNotification(diff float64) {
+func (mc *MinerConn) sendDifficultyNotification(diff float64) bool {
+	if mc.closed.Load() {
+		return false
+	}
 	if !mc.subscribed {
 		mc.pendingDifficulty = true
-		return
+		return true
 	}
 	mc.pendingDifficulty = false
 	msg := map[string]any{
@@ -1454,9 +1581,11 @@ func (mc *MinerConn) sendDifficultyNotification(diff float64) {
 	}
 	if err := mc.writeJSON(msg); err != nil {
 		logger.Error("difficulty write error", "remote", mc.id, "error", err)
-		return
+		mc.Close("mining.set_difficulty write failed")
+		return false
 	}
 	logger.Info("difficulty sent", "component", "miner", "kind", "lifecycle", "remote", mc.id, "difficulty", diff)
+	return true
 }
 
 type stratumDifficulty float64
@@ -1503,35 +1632,172 @@ func (mc *MinerConn) startupPrimedDifficulty(diff float64) float64 {
 	return primed
 }
 
-func (mc *MinerConn) sendVersionMask() {
-	if !mc.subscribed {
-		mc.pendingVersionMask = true
-		return
+func (mc *MinerConn) sendVersionMask() bool {
+	if mc.closed.Load() {
+		return false
 	}
+	mc.versionMu.Lock()
+	if !mc.subscribed {
+		if mc.versionRoll {
+			mc.pendingVersionMask = true
+		}
+		mc.versionMu.Unlock()
+		return true
+	}
+	if !mc.versionRoll {
+		mc.pendingVersionMask = false
+		mc.versionMu.Unlock()
+		return true
+	}
+	mask := mc.versionMask
 	mc.pendingVersionMask = false
+	mc.versionMu.Unlock()
 	msg := map[string]any{
 		"id":     nil,
 		"method": "mining.set_version_mask",
-		"params": []any{uint32ToHex8Lower(mc.versionMask)},
+		"params": []any{uint32ToHex8Lower(mask)},
 	}
 	if err := mc.writeJSON(msg); err != nil {
 		logger.Error("version mask write error", "remote", mc.id, "error", err)
+		mc.Close("mining.set_version_mask write failed")
+		return false
+	}
+	return true
+}
+
+func (mc *MinerConn) sendPendingStratumSetup() bool {
+	if mc.closed.Load() {
+		return false
+	}
+	if !mc.subscribed {
+		return true
+	}
+	if mc.pendingDifficulty {
+		if !mc.sendDifficultyNotification(mc.currentDifficulty()) {
+			return false
+		}
+	}
+	mc.versionMu.Lock()
+	pendingVersionMask := mc.pendingVersionMask && mc.versionRoll
+	mc.versionMu.Unlock()
+	if pendingVersionMask {
+		if !mc.sendVersionMask() {
+			return false
+		}
+	}
+	return !mc.closed.Load()
+}
+
+// versionRollingPolicySnapshot returns the current connection-wide BIP310
+// policy. BIP310 masks apply immediately to every active job, so submit parsing
+// must use this state rather than policy captured with an older job.
+func (mc *MinerConn) versionRollingPolicySnapshot() (active bool, mask uint32) {
+	mc.versionMu.Lock()
+	active = mc.versionRoll
+	mask = mc.versionMask
+	mc.versionMu.Unlock()
+	return active, mask
+}
+
+func (mc *MinerConn) versionRollingPolicyHistorySnapshot(dst []uint32) (active bool, mask uint32, history []uint32) {
+	mc.versionMu.Lock()
+	active = mc.versionRoll
+	mask = mc.versionMask
+	history = append(dst, mc.versionMaskHistory...)
+	mc.versionMu.Unlock()
+	return active, mask, history
+}
+
+func (mc *MinerConn) rememberVersionMaskLocked(mask uint32) {
+	limit := mc.maxRecentJobs
+	if limit <= 0 {
+		limit = defaultRecentJobs
+	}
+	// Cover both active jobs and the equally sized block-only retirement tier.
+	limit *= 2
+	if limit > maxVersionMaskRescueHistory {
+		limit = maxVersionMaskRescueHistory
+	}
+	for i, existing := range mc.versionMaskHistory {
+		if existing != mask {
+			continue
+		}
+		// Move a repeated mask to the newest position so the bounded history
+		// follows transition recency rather than first appearance.
+		copy(mc.versionMaskHistory[i:], mc.versionMaskHistory[i+1:])
+		mc.versionMaskHistory = mc.versionMaskHistory[:len(mc.versionMaskHistory)-1]
+		break
+	}
+	mc.versionMaskHistory = append(mc.versionMaskHistory, mask)
+	if len(mc.versionMaskHistory) > limit {
+		overflow := len(mc.versionMaskHistory) - limit
+		copy(mc.versionMaskHistory, mc.versionMaskHistory[overflow:])
+		mc.versionMaskHistory = mc.versionMaskHistory[:limit]
+		if !mc.versionMaskHistoryOverflowed {
+			mc.versionMaskHistoryOverflowed = true
+			logger.Warn("version-mask rescue history full; discarded oldest policy",
+				"remote", mc.id,
+				"limit", limit,
+			)
+		}
 	}
 }
 
-func (mc *MinerConn) sendPendingStratumSetup() {
-	if !mc.subscribed {
-		return
+func (mc *MinerConn) queueVersionMaskIfActive() {
+	mc.versionMu.Lock()
+	if mc.versionRoll {
+		mc.pendingVersionMask = true
 	}
-	if mc.pendingDifficulty {
-		mc.sendDifficultyNotification(mc.currentDifficulty())
+	mc.versionMu.Unlock()
+}
+
+// negotiateVersionRolling atomically applies a mining.configure request to the
+// connection's BIP310 state. Only a successful negotiation activates the
+// extension; retaining a denied miner mask must never auto-activate it later.
+func (mc *MinerConn) negotiateVersionRolling(requestMask uint32, maskProvided bool, requestedMinBits int, minBitsProvided bool) (mask uint32, minBits int, ok bool) {
+	mc.versionMu.Lock()
+	defer mc.versionMu.Unlock()
+
+	if !maskProvided {
+		// BIP310 defines an omitted miner mask as all bits available. Keep that
+		// capability for later server-mask changes instead of freezing it to the
+		// pool mask that happened to be active during configuration.
+		requestMask = ^uint32(0)
 	}
-	if mc.pendingVersionMask && mc.versionRoll {
-		mc.sendVersionMask()
+	if !minBitsProvided {
+		requestedMinBits = mc.minVerBits
 	}
+	if requestedMinBits <= 0 {
+		requestedMinBits = 1
+	}
+
+	mc.minerMask = requestMask
+	mask = requestMask & mc.poolMask
+	if mc.poolMask == 0 || mask == 0 {
+		mc.versionRoll = false
+		// With BIP310 inactive, preserve the pool mask for legacy compatibility
+		// handling without treating it as a negotiated client mask.
+		mc.versionMask = mc.poolMask
+		mc.minVerBits = requestedMinBits
+		mc.pendingVersionMask = false
+		return 0, requestedMinBits, false
+	}
+
+	available := bits.OnesCount32(mask)
+	if requestedMinBits > available {
+		requestedMinBits = available
+	}
+	mc.minVerBits = requestedMinBits
+	mc.versionRoll = true
+	mc.versionMask = mask
+	mc.rememberVersionMaskLocked(mask)
+	return mask, requestedMinBits, true
 }
 
 func (mc *MinerConn) updateVersionMask(poolMask uint32) bool {
+	mc.versionMu.Lock()
+	defer mc.versionMu.Unlock()
+
 	changed := false
 	if mc.poolMask != poolMask {
 		mc.poolMask = poolMask
@@ -1539,25 +1805,6 @@ func (mc *MinerConn) updateVersionMask(poolMask uint32) bool {
 	}
 
 	if !mc.versionRoll {
-		if mc.minerMask != 0 {
-			final := poolMask & mc.minerMask
-			if final != 0 {
-				available := bits.OnesCount32(final)
-				if mc.minVerBits <= 0 {
-					mc.minVerBits = 1
-				}
-				if mc.minVerBits > available {
-					mc.minVerBits = available
-					changed = true
-				}
-				if mc.versionMask != final {
-					changed = true
-				}
-				mc.versionMask = final
-				mc.versionRoll = true
-				return changed
-			}
-		}
 		if mc.versionMask != poolMask {
 			changed = true
 		}
@@ -1566,16 +1813,11 @@ func (mc *MinerConn) updateVersionMask(poolMask uint32) bool {
 	}
 
 	finalMask := poolMask & mc.minerMask
-	if finalMask == 0 {
-		if mc.versionMask != 0 {
-			changed = true
-		}
-		mc.versionMask = 0
-		mc.versionRoll = false
-		return changed
-	}
-
 	available := bits.OnesCount32(finalMask)
+	if available > 0 && mc.minVerBits <= 0 {
+		mc.minVerBits = 1
+		changed = true
+	}
 	if mc.minVerBits > available {
 		mc.minVerBits = available
 		changed = true
@@ -1584,12 +1826,16 @@ func (mc *MinerConn) updateVersionMask(poolMask uint32) bool {
 		changed = true
 	}
 	mc.versionMask = finalMask
+	mc.rememberVersionMaskLocked(finalMask)
 	return changed
 }
 
-func (mc *MinerConn) sendSetExtranonce(ex1 string, en2Size int) {
+func (mc *MinerConn) sendSetExtranonce(ex1 string, en2Size int) bool {
+	if mc.closed.Load() {
+		return false
+	}
 	if !mc.subscribed {
-		return
+		return true
 	}
 	msg := map[string]any{
 		"id":     nil,
@@ -1598,12 +1844,18 @@ func (mc *MinerConn) sendSetExtranonce(ex1 string, en2Size int) {
 	}
 	if err := mc.writeJSON(msg); err != nil {
 		logger.Error("set_extranonce write error", "remote", mc.id, "error", err)
+		mc.Close("mining.set_extranonce write failed")
+		return false
 	}
+	return true
 }
 
 func (mc *MinerConn) handleExtranonceSubscribe(req *StratumRequest) {
 	mc.extranonceSubscribed = true
-	mc.writeTrueResponse(req.ID)
+	if !mc.writeTrueResponse(req.ID) {
+		mc.Close("mining.extranonce.subscribe response write failed")
+		return
+	}
 
 	ex1 := hex.EncodeToString(mc.extranonce1)
 	en2Size := mc.cfg.Extranonce2Size

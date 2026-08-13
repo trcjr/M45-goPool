@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
+
+	"github.com/btcsuite/btcd/btcutil"
 )
 
 func (jm *JobManager) ensureTemplateFresh(ctx context.Context, tpl GetBlockTemplateResult) error {
@@ -13,8 +15,18 @@ func (jm *JobManager) ensureTemplateFresh(ctx context.Context, tpl GetBlockTempl
 		return fmt.Errorf("template curtime invalid: %d", tpl.CurTime)
 	}
 
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timeout := jm.refreshRPCTimeout
+	if timeout <= 0 {
+		timeout = jobTemplateRefreshTimeout
+	}
+	verifyCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	var bestHash string
-	if err := jm.rpc.callCtx(ctx, "getbestblockhash", nil, &bestHash); err != nil {
+	if err := jm.rpc.callCtx(verifyCtx, "getbestblockhash", nil, &bestHash); err != nil {
 		return fmt.Errorf("getbestblockhash: %w", err)
 	}
 
@@ -22,15 +34,9 @@ func (jm *JobManager) ensureTemplateFresh(ctx context.Context, tpl GetBlockTempl
 		return fmt.Errorf("%w: prev hash %s does not match best %s", errStaleTemplate, tpl.Previous, bestHash)
 	}
 
-	jm.mu.RLock()
-	cur := jm.curJob
-	jm.mu.RUnlock()
-	if cur != nil && tpl.Height < cur.Template.Height {
-		return fmt.Errorf("%w: template height regressed from %d to %d", errStaleTemplate, cur.Template.Height, tpl.Height)
-	}
-	if cur != nil && tpl.CurTime < cur.Template.CurTime {
-		return fmt.Errorf("%w: template curtime regressed from %d to %d", errStaleTemplate, cur.Template.CurTime, tpl.CurTime)
-	}
+	// Do not compare height or curtime with the previous job here. A legitimate
+	// chain reorganization can move either value backward. Matching bitcoind's
+	// current best hash is the authoritative freshness check.
 	return nil
 }
 
@@ -48,8 +54,8 @@ func validateWitnessCommitment(commitment string) error {
 	return nil
 }
 
-func validateTransactions(txs []GBTTransaction) ([][]byte, error) {
-	txids := make([][]byte, len(txs)) // Pre-allocate exact size since we know we'll add all txs
+func validateTransactions(txs []GBTTransaction) ([]*btcutil.Tx, error) {
+	transactions := make([]*btcutil.Tx, len(txs))
 	for i, tx := range txs {
 		if len(tx.Txid) != 64 {
 			return nil, fmt.Errorf("tx %d has invalid txid length: %d bytes", i, len(tx.Txid)/2)
@@ -70,18 +76,13 @@ func validateTransactions(txs []GBTTransaction) ([][]byte, error) {
 			return nil, fmt.Errorf("tx %d data empty", i)
 		}
 
-		base, hasWitness, err := stripWitnessData(raw)
+		parsedTx, err := btcutil.NewTxFromBytes(raw)
 		if err != nil {
 			return nil, fmt.Errorf("tx %d decode: %w", i, err)
 		}
 
-		hashInput := raw
-		if hasWitness {
-			hashInput = base
-		}
-
-		computedRaw := doubleSHA256(hashInput)
-		if !bytes.Equal(reverseBytes(computedRaw), txidBytes) && !bytes.Equal(computedRaw, txidBytes) {
+		computedTxID := parsedTx.Hash()
+		if !bytes.Equal(reverseBytes(computedTxID[:]), txidBytes) {
 			return nil, fmt.Errorf("tx %d txid mismatch with provided data", i)
 		}
 
@@ -93,15 +94,15 @@ func validateTransactions(txs []GBTTransaction) ([][]byte, error) {
 			if len(wtxidBytes) != 32 {
 				return nil, fmt.Errorf("tx %d wtxid must be 32 bytes, got %d", i, len(wtxidBytes))
 			}
-			wtxidRaw := doubleSHA256(raw)
-			if !bytes.Equal(reverseBytes(wtxidRaw), wtxidBytes) && !bytes.Equal(wtxidRaw, wtxidBytes) {
+			computedWTxID := parsedTx.MsgTx().WitnessHash()
+			if !bytes.Equal(reverseBytes(computedWTxID[:]), wtxidBytes) {
 				return nil, fmt.Errorf("tx %d wtxid mismatch with provided data", i)
 			}
 		}
 
-		txids[i] = reverseBytes(computedRaw)
+		transactions[i] = parsedTx
 	}
-	return txids, nil
+	return transactions, nil
 }
 
 func validateBits(bitsStr, targetStr string) (*big.Int, error) {
@@ -133,11 +134,19 @@ func validateBits(bitsStr, targetStr string) (*big.Int, error) {
 }
 
 // templateChanged returns (needsNewJob, clean).
-// needsNewJob is true if any meaningful change occurred (prev/height/bits/transactions).
-// clean is true only if prev/height/bits changed, indicating miners must discard old work.
-// Transaction-only changes require a new job (for updated merkle branches) but not clean=true,
-// allowing miners to continue using their current nonce range.
+// needsNewJob is true when the effective header policy or coherent
+// coinbase/transaction payload changes. clean is reserved for changes that
+// invalidate the prior header search space; payload-only updates keep old work
+// valid while advertising a new candidate.
 func (jm *JobManager) templateChanged(tpl GetBlockTemplateResult) (needsNewJob, clean bool) {
+	jm.applyMu.Lock()
+	defer jm.applyMu.Unlock()
+	return jm.templateChangedLocked(tpl)
+}
+
+// templateChangedLocked compares against one coherent runtime configuration
+// snapshot. The caller must hold jm.applyMu.
+func (jm *JobManager) templateChangedLocked(tpl GetBlockTemplateResult) (needsNewJob, clean bool) {
 	jm.mu.RLock()
 	cur := jm.curJob
 	jm.mu.RUnlock()
@@ -146,12 +155,23 @@ func (jm *JobManager) templateChanged(tpl GetBlockTemplateResult) (needsNewJob, 
 		return true, true
 	}
 	prev := cur.Template
+	next := tpl
+	next.Version = applyConfiguredVersionBits(tpl.Version, jm.cfg)
+	nextVersionMask := computePoolMask(tpl, jm.cfg)
 
-	// Check if previousblockhash, height, or bits changed - these require clean=true.
-	if tpl.Previous != prev.Previous ||
-		tpl.Height != prev.Height ||
-		tpl.Bits != prev.Bits {
+	// Header and version-policy changes require miners to discard previously
+	// advertised work. Keep this definition aligned with cleanFlagFor so a
+	// coalesced subscriber update cannot hide an intervening clean transition.
+	if miningTemplateRequiresClean(prev, cur.VersionMask, next, nextVersionMask) {
 		return true, true
+	}
+
+	// Coinbase and transaction updates form a new, internally coherent job, but
+	// old work on the same header policy remains valid and need not be discarded.
+	if tpl.CoinbaseValue != prev.CoinbaseValue ||
+		tpl.DefaultWitnessCommitment != prev.DefaultWitnessCommitment ||
+		tpl.CoinbaseAux.Flags != prev.CoinbaseAux.Flags {
+		return true, false
 	}
 
 	// Check if transactions changed - requires new job but not clean.
@@ -159,11 +179,23 @@ func (jm *JobManager) templateChanged(tpl GetBlockTemplateResult) (needsNewJob, 
 		return true, false
 	}
 	for i, tx := range tpl.Transactions {
-		if tx.Txid != prev.Transactions[i].Txid {
+		prevTx := prev.Transactions[i]
+		if tx.Txid != prevTx.Txid || tx.Hash != prevTx.Hash || tx.Data != prevTx.Data {
 			return true, false
 		}
 	}
 
 	// No meaningful changes.
 	return false, false
+}
+
+func miningTemplateRequiresClean(prev GetBlockTemplateResult, prevVersionMask uint32, next GetBlockTemplateResult, nextVersionMask uint32) bool {
+	return next.Previous != prev.Previous ||
+		next.Height != prev.Height ||
+		next.Mintime != prev.Mintime ||
+		next.Bits != prev.Bits ||
+		next.Target != prev.Target ||
+		next.Version != prev.Version ||
+		next.VbRequired != prev.VbRequired ||
+		nextVersionMask != prevVersionMask
 }

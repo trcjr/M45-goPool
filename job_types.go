@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"math/big"
 	"sync"
@@ -40,32 +41,37 @@ type GBTTransaction struct {
 }
 
 type Job struct {
-	JobID                   string
-	NotifyReason            string
-	Template                GetBlockTemplateResult
-	Target                  *big.Int
-	targetBE                [32]byte
-	CreatedAt               time.Time
-	Clean                   bool
-	Extranonce2Size         int
-	CoinbaseValue           int64
-	WitnessCommitment       string
-	CoinbaseMsg             string
-	MerkleBranches          []string
-	merkleBranchesBytes     [][32]byte
-	Transactions            []GBTTransaction
-	TransactionIDs          [][]byte
-	PayoutScript            []byte
-	DonationScript          []byte
-	OperatorDonationPercent float64
-	VersionMask             uint32
-	PrevHash                string
-	prevHashBytes           [32]byte
-	bitsBytes               [4]byte
-	coinbaseFlagsBytes      []byte
-	witnessCommitScript     []byte
-	ScriptTime              int64
-	TemplateExtraNonce2Size int
+	JobID                     string
+	NotifyReason              string
+	Generation                uint64
+	Template                  GetBlockTemplateResult
+	Target                    *big.Int
+	targetBE                  [32]byte
+	CreatedAt                 time.Time
+	Clean                     bool
+	Extranonce2Size           int
+	CoinbaseValue             int64
+	WitnessCommitment         string
+	CoinbaseMsg               string
+	MerkleBranches            []string
+	merkleBranchesBytes       [][32]byte
+	Transactions              []GBTTransaction
+	TransactionIDs            [][]byte
+	PayoutScript              []byte
+	PayoutAddress             string
+	PoolFeePercent            float64
+	PayoutPolicyCaptured      bool
+	DonationScript            []byte
+	OperatorDonationPercent   float64
+	VersionMask               uint32
+	PrevHash                  string
+	prevHashBytes             [32]byte
+	bitsBytes                 [4]byte
+	coinbaseFlagsBytes        []byte
+	witnessCommitScript       []byte
+	ScriptTime                int64
+	TemplateExtraNonce2Size   int
+	CoinbaseScriptSigMaxBytes int
 }
 
 const (
@@ -101,13 +107,17 @@ const jobFeedErrorHistorySize = 3
 type JobManager struct {
 	rpc                 *RPCClient
 	cfg                 Config
+	zmqHashBlockAddr    string
+	zmqRawBlockAddr     string
 	metrics             *PoolMetrics
 	mu                  sync.RWMutex
 	curJob              *Job
+	longPollID          string // Latest accepted opaque cursor; independent of published job identity.
 	payoutScript        []byte
 	donationScript      []byte
 	extraID             uint32
 	jobIDCounter        uint64
+	jobGeneration       uint64
 	subs                map[chan *Job]struct{}
 	subsMu              sync.Mutex
 	zmqHashblockHealthy atomic.Bool
@@ -123,9 +133,23 @@ type JobManager struct {
 	// template application from longpoll/ZMQ.
 	refreshMu          sync.Mutex
 	lastRefreshAttempt time.Time
+	refreshRPCTimeout  time.Duration
 	applyMu            sync.Mutex
-	zmqPayload         JobFeedPayloadStatus
-	zmqPayloadMu       sync.RWMutex
+	// historyMu serializes the best-effort block-history worker. At most one
+	// RPC walk is active and one newest request is pending, so template churn
+	// cannot create an unbounded goroutine/RPC backlog.
+	historyMu         sync.Mutex
+	historyRunning    bool
+	historyPending    blockHistoryRefreshRequest
+	historyPendingSet bool
+	historyLatest     uint64
+	historyCtx        context.Context
+	historyRPCTimeout time.Duration
+	// blockTipSequence advances when an authoritative raw-block notification
+	// replaces the payload tip. It is guarded by zmqPayloadMu.
+	blockTipSequence uint64
+	zmqPayload       JobFeedPayloadStatus
+	zmqPayloadMu     sync.RWMutex
 	// nodeSync* tracks whether the node is in a usable state for mining.
 	// When the node reports IBD/syncing, we treat Stratum as degraded to avoid
 	// miners wasting power on stale work.
@@ -146,13 +170,17 @@ type JobManager struct {
 
 func NewJobManager(rpc *RPCClient, cfg Config, metrics *PoolMetrics, payoutScript []byte, donationScript []byte) *JobManager {
 	return &JobManager{
-		rpc:            rpc,
-		cfg:            cfg,
-		metrics:        metrics,
-		payoutScript:   payoutScript,
-		donationScript: donationScript,
-		subs:           make(map[chan *Job]struct{}),
-		notifyQueue:    make(chan *Job, 100), // Buffered queue for async notifications
+		rpc:               rpc,
+		cfg:               cfg,
+		zmqHashBlockAddr:  cfg.ZMQHashBlockAddr,
+		zmqRawBlockAddr:   cfg.ZMQRawBlockAddr,
+		metrics:           metrics,
+		payoutScript:      append([]byte(nil), payoutScript...),
+		donationScript:    append([]byte(nil), donationScript...),
+		subs:              make(map[chan *Job]struct{}),
+		notifyQueue:       make(chan *Job, 100), // Buffered queue for async notifications
+		refreshRPCTimeout: jobTemplateRefreshTimeout,
+		historyRPCTimeout: jobBlockHistoryRefreshTimeout,
 	}
 }
 

@@ -9,8 +9,10 @@ import (
 
 // submitBlockWithFastRetry aggressively retries submitblock without backoff
 // to maximize the chance of winning the propagation race. It retries every
-// 100ms until either submitblock succeeds, a newer job height is observed,
-// or a safety window elapses.
+// 100ms until either submitblock succeeds or a safety window elapses.
+//
+// A newer template must not cancel delivery: a block extending a displaced
+// branch can add enough work to make that branch the best chain again.
 func (mc *MinerConn) submitBlockWithFastRetry(job *Job, workerName, hashHex, blockHex string, submitRes *any) error {
 	const (
 		retryInterval = 100 * time.Millisecond
@@ -20,9 +22,8 @@ func (mc *MinerConn) submitBlockWithFastRetry(job *Job, workerName, hashHex, blo
 		// confirmTimeout bounds getblockheader checks used to detect cases where
 		// submitblock may have succeeded but the RPC response timed out.
 		confirmTimeout = 2 * time.Second
-		// maxRetryWindow is a final safety cap; in practice we expect to
-		// stop much sooner when a new block is seen. Using a full block
-		// interval keeps us racing hard for rare finds.
+		// maxRetryWindow is a final safety cap. Using a full block interval
+		// keeps us racing hard for rare finds through transient RPC failures.
 		maxRetryWindow = 10 * time.Minute
 	)
 
@@ -53,12 +54,29 @@ func (mc *MinerConn) submitBlockWithFastRetry(job *Job, workerName, hashHex, blo
 
 		// Use a per-call timeout to prevent indefinite hangs on unresponsive RPC.
 		// The retry loop continues regardless; we just don't want one call to block forever.
+		if submitRes != nil {
+			*submitRes = nil
+		}
 		callCtx, cancel := context.WithTimeout(context.Background(), rpcCallTimeout)
 		err := mc.rpc.callCtx(callCtx, "submitblock", []any{blockHex}, submitRes)
 		cancel()
 
+		var attemptErr error
 		if err == nil {
-			if resultErr := submitBlockResultError(submitRes); resultErr != nil {
+			disposition, resultErr := classifySubmitBlockResult(submitRes)
+			switch disposition {
+			case submitBlockResultAccepted:
+				if attempt > 1 {
+					logger.Info("submitblock succeeded after retries",
+						"attempts", attempt,
+						"worker", mc.minerName(workerName),
+						"hash", hashHex,
+					)
+				}
+				return nil
+			case submitBlockResultRetryable:
+				attemptErr = resultErr
+			case submitBlockResultRejected:
 				if blockAccepted() {
 					logger.Warn("submitblock returned rejection but block is in chain; treating as success",
 						"attempts", attempt,
@@ -70,51 +88,31 @@ func (mc *MinerConn) submitBlockWithFastRetry(job *Job, workerName, hashHex, blo
 				}
 				return resultErr
 			}
-			if attempt > 1 {
-				logger.Info("submitblock succeeded after retries",
+		} else {
+			attemptErr = err
+
+			// If submitblock timed out client-side, check whether the block was
+			// accepted anyway. This commonly happens when bitcoind's RPC work
+			// queue is saturated.
+			if errors.Is(err, context.DeadlineExceeded) && blockAccepted() {
+				logger.Warn("submitblock timed out but block is in chain; treating as success",
 					"attempts", attempt,
 					"worker", mc.minerName(workerName),
 					"hash", hashHex,
 				)
+				return nil
 			}
-			return nil
 		}
-		lastErr = err
-
-		// If submitblock timed out client-side, check whether the block was
-		// accepted anyway. This commonly happens when bitcoind's RPC work
-		// queue is saturated.
-		if errors.Is(err, context.DeadlineExceeded) && blockAccepted() {
-			logger.Warn("submitblock timed out but block is in chain; treating as success",
-				"attempts", attempt,
-				"worker", mc.minerName(workerName),
-				"hash", hashHex,
-			)
-			return nil
-		}
+		lastErr = attemptErr
 
 		// Log the first failure loudly; subsequent failures are summarized
 		// when we eventually give up.
 		if attempt == 1 {
 			logger.Error("submitblock error; retrying aggressively",
-				"error", err,
+				"error", attemptErr,
 				"worker", mc.minerName(workerName),
 				"hash", hashHex,
 			)
-		}
-
-		// If we've already seen a newer template height, there's no point
-		// continuing to spam submitblock for this block.
-		if mc.jobMgr != nil && job != nil {
-			if cur := mc.jobMgr.CurrentJob(); cur != nil && cur.Template.Height > job.Template.Height {
-				logger.Warn("submitblock giving up after new block seen",
-					"original_height", job.Template.Height,
-					"current_height", cur.Template.Height,
-					"attempts", attempt,
-					"error", err,
-				)
-				return err
-			}
 		}
 
 		// Safety stop: avoid spinning forever if the node is persistently
@@ -132,17 +130,40 @@ func (mc *MinerConn) submitBlockWithFastRetry(job *Job, workerName, hashHex, blo
 	}
 }
 
-func submitBlockResultError(submitRes *any) error {
+type submitBlockResultDisposition uint8
+
+const (
+	submitBlockResultAccepted submitBlockResultDisposition = iota
+	submitBlockResultRetryable
+	submitBlockResultRejected
+)
+
+// classifySubmitBlockResult interprets Bitcoin Core's BIP22 submitblock
+// result. A valid block that Core already processed returns "duplicate",
+// including when it is on a side chain, so delivery is complete. The two
+// inconclusive results do not establish either acceptance or rejection and
+// must be retried while the fast submission window remains open.
+func classifySubmitBlockResult(submitRes *any) (submitBlockResultDisposition, error) {
 	if submitRes == nil || *submitRes == nil {
-		return nil
+		return submitBlockResultAccepted, nil
 	}
-	switch v := (*submitRes).(type) {
-	case string:
-		if v == "" {
-			return nil
-		}
-		return fmt.Errorf("submitblock rejected: %s", v)
+	v, ok := (*submitRes).(string)
+	if !ok {
+		return submitBlockResultRejected, fmt.Errorf("submitblock returned unexpected result %T: %v", *submitRes, *submitRes)
+	}
+	switch v {
+	case "duplicate":
+		return submitBlockResultAccepted, nil
+	case "inconclusive", "duplicate-inconclusive":
+		return submitBlockResultRetryable, fmt.Errorf("submitblock inconclusive: %s", v)
+	case "":
+		return submitBlockResultRetryable, fmt.Errorf("submitblock returned empty result")
 	default:
-		return fmt.Errorf("submitblock returned unexpected result %T: %v", *submitRes, *submitRes)
+		return submitBlockResultRejected, fmt.Errorf("submitblock rejected: %s", v)
 	}
+}
+
+func submitBlockResultError(submitRes *any) error {
+	_, err := classifySubmitBlockResult(submitRes)
+	return err
 }

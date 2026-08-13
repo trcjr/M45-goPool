@@ -7,16 +7,19 @@ type submitParams struct {
 	ntime            string
 	nonce            string
 	submittedVersion uint32
+	versionProvided  bool
 }
 
 type shareContext struct {
-	header     []byte
-	cbTx       []byte
-	merkleRoot []byte
-	hashLE     []byte
-	hashHex    string
-	shareDiff  float64
-	isBlock    bool
+	header           []byte
+	cbTx             []byte
+	merkleRoot       []byte
+	hashLE           []byte
+	hashHex          string
+	shareDiff        float64
+	isBlock          bool
+	rescueCoinbase   []byte
+	rescueMerkleRoot [32]byte
 }
 
 func uint256BELessOrEqual(a [32]byte, b [32]byte) bool {

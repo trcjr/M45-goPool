@@ -23,10 +23,15 @@ import (
 )
 
 func main() {
+	os.Exit(run())
+}
+
+func run() (exitCode int) {
 	// Top-level panic handler: ensure any unexpected panic is captured to
 	// panic.log with a stack trace so operators can inspect it.
 	defer func() {
 		if r := recover(); r != nil {
+			exitCode = 1
 			path := "panic.log"
 			if f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
 				defer f.Close()
@@ -158,6 +163,7 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	statusServeErrCh := make(chan error, 1)
 
 	// Set up SIGUSR1/SIGUSR2 handler for template/config reloading
 	reloadChan := make(chan os.Signal, 1)
@@ -269,7 +275,7 @@ func main() {
 		}
 	}
 	configureFileLogging(logPath, errorLogPath, debugLogPath, *stdoutLogFlag)
-	ensureSubmissionWorkerPool()
+	submissionPool := ensureSubmissionWorkerPool()
 	defer logger.Stop()
 
 	var netLogPath string
@@ -351,6 +357,10 @@ func main() {
 		fatal("initialize shared state database", err)
 	}
 	defer closeSharedStateDB()
+	if recoverErr := waitForPendingSubmissionSpoolRecovery(ctx, cfg.DataDir); recoverErr != nil {
+		logger.Error("emergency pending block recovery interrupted", "component", "startup", "kind", "block_recovery", "error", recoverErr)
+		return 1
+	}
 
 	startTime := time.Now()
 	metrics := NewPoolMetrics()
@@ -428,9 +438,14 @@ func main() {
 	}
 	rpcClient := NewRPCClient(cfg, metrics)
 	rpcClient.StartCookieWatcher(ctx)
-	// Best-effort replay of any blocks that failed submitblock while the
-	// node RPC was unavailable in previous runs.
-	startPendingSubmissionReplayer(ctx, rpcClient)
+	// Recover and replay any blocks that failed submitblock while the node RPC
+	// was unavailable in previous runs. Startup cannot admit miners until stale
+	// in-flight rows are safely replayable.
+	pendingReplayDone, replayErr := startPendingSubmissionReplayer(ctx, rpcClient)
+	if replayErr != nil {
+		logger.Error("pending block startup recovery interrupted", "component", "startup", "kind", "block_recovery", "error", replayErr)
+		return 1
+	}
 
 	accounting, err := NewAccountStore(cfg, debugEnabled(), cleanBansOnStartup)
 	if err != nil {
@@ -608,6 +623,14 @@ func main() {
 	mux.HandleFunc("/stats/", func(w http.ResponseWriter, r *http.Request) {
 		statusServer.handleWorkerLookupByWallet(w, r, "/stats")
 	})
+	acmeWebroot, err := ensureACMEWebroot(cfg.DataDir)
+	if err != nil {
+		fatal("acme webroot", err)
+	}
+	acmeHandler := newACMEChallengeHandler(acmeWebroot)
+	mux.Handle(acmeChallengeURLPrefix, acmeHandler)
+	logger.Info("ACME HTTP-01 webroot enabled", "component", "http", "kind", "acme", "path", acmeWebroot)
+
 	// Catch-all: try embedded static files first, fall back to status server.
 	staticFiles, err := newEmbeddedStaticFileServer(statusServer)
 	if err != nil {
@@ -658,7 +681,7 @@ func main() {
 		httpLogMsg := "status page listening (http)"
 		httpLogFields := []any{"addr", httpAddr}
 		if needStatusTLS {
-			httpHandler = http.HandlerFunc(statusServer.redirectToHTTPS)
+			httpHandler = serveACMEOrFallback(acmeHandler, http.HandlerFunc(statusServer.redirectToHTTPS))
 			httpLogMsg = "status http listener redirecting to https"
 			httpLogFields = append(httpLogFields, "https_addr", httpsAddr)
 		}
@@ -675,7 +698,7 @@ func main() {
 			httpLogFields = append([]any{"component", "http", "kind", "listen"}, httpLogFields...)
 			logger.Info(httpLogMsg, httpLogFields...)
 			if err := statusHTTPServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				fatal("status server error", err)
+				reportStatusServeError(err, stop, statusServeErrCh)
 			}
 		}()
 	}
@@ -697,7 +720,7 @@ func main() {
 		go func() {
 			logger.Info("status page listening (https)", "component", "http", "kind", "listen", "addr", httpsAddr, "cert", certPath)
 			if err := statusHTTPSServer.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				fatal("status server error", err)
+				reportStatusServeError(err, stop, statusServeErrCh)
 			}
 		}()
 	}
@@ -830,6 +853,7 @@ func main() {
 	}
 
 	var connWg sync.WaitGroup
+	var acceptWg sync.WaitGroup
 
 	go func() {
 		<-ctx.Done()
@@ -862,7 +886,7 @@ func main() {
 			if now.Sub(startTime) >= stratumStartupGrace {
 				if h := stratumHealthStatus(jobMgr, now); !h.Healthy {
 					if unhealthySince.IsZero() {
-						unhealthySince = now
+						unhealthySince = h.unhealthyStart(now)
 					}
 					if now.Sub(unhealthySince) >= stratumStaleJobGrace {
 						if time.Since(lastRefuseLog) > 5*time.Second {
@@ -958,9 +982,18 @@ func main() {
 	// lifetime is tied to the primary TCP listener. Optional TLS
 	// listener runs in a background goroutine.
 	if tlsLn != nil {
-		go serveStratum("tls", tlsLn)
+		acceptWg.Add(1)
+		go func() {
+			defer acceptWg.Done()
+			serveStratum("tls", tlsLn)
+		}()
 	}
 	serveStratum("tcp", ln)
+	// The primary listener normally returns because ctx was canceled. Also
+	// cancel explicitly for an unexpected listener closure so the TLS accept
+	// loop cannot outlive the primary server or add connections during drain.
+	stop()
+	acceptWg.Wait()
 
 	logger.Info("shutdown requested; draining active miners", "component", "stratum", "kind", "shutdown")
 	shutdownStart := time.Now()
@@ -975,11 +1008,33 @@ func main() {
 		close(done)
 	}()
 
+	drainWarning := time.NewTimer(10 * time.Second)
 	select {
 	case <-done:
-	case <-time.After(10 * time.Second):
-		logger.Warn("timed out waiting for miners to drain", "component", "stratum", "kind", "shutdown", "waited", time.Since(shutdownStart))
+		if !drainWarning.Stop() {
+			select {
+			case <-drainWarning.C:
+			default:
+			}
+		}
+	case <-drainWarning.C:
+		logger.Warn("still waiting for miners to drain", "component", "stratum", "kind", "shutdown", "waited", time.Since(shutdownStart))
+		// Inline block delivery may intentionally retry for up to a full block
+		// interval. Keep waiting so shutdown cannot abandon that winning task.
+		<-done
 	}
+
+	// No accept loop or miner handler can submit after connWg completes. Close
+	// the queue and wait for all queued and in-flight asynchronous submissions
+	// before flushing state or stopping the database and logger they depend on.
+	logger.Info("draining submission workers", "component", "stratum", "kind", "shutdown")
+	submissionPool.drainAndClose()
+	if pendingReplayDone != nil {
+		<-pendingReplayDone
+	}
+	// All miner and submission producers are stopped, so this barrier ensures
+	// accepted-block audit rows reach SQLite before checkpoint and close.
+	drainFoundBlockLogger()
 
 	if accounting != nil {
 		if err := accounting.Flush(); err != nil {
@@ -996,31 +1051,29 @@ func main() {
 
 	// Best-effort checkpoint to flush WAL into the main DB on shutdown.
 	checkpointSharedStateDB()
-	// Best-effort sync of log files on shutdown so buffered OS writes are
-	// forced to disk.
 	logger.Info("shutdown complete", "component", "startup", "kind", "shutdown", "uptime", time.Since(startTime))
+	// Closing the active rolling writers syncs their actual dated files. The
+	// network log has a separate writer from the primary logger.
+	if err := setNetLogRuntime(false, nil); err != nil {
+		logger.Warn("close net log", "component", "startup", "kind", "log_sync", "error", err)
+	}
 	logger.Stop()
 
-	// Best-effort sync of log files on shutdown so buffered OS writes are
-	// forced to disk.
-	if err := syncFileIfExists(logPath); err != nil {
-		logger.Error("sync pool log", "component", "startup", "kind", "log_sync", "error", err)
+	select {
+	case <-statusServeErrCh:
+		return 1
+	default:
+		return 0
 	}
-	if debugLogPath != "" {
-		if err := syncFileIfExists(debugLogPath); err != nil {
-			logger.Error("sync debug log", "component", "startup", "kind", "log_sync", "error", err)
-		}
+}
+
+func reportStatusServeError(err error, stop context.CancelFunc, errCh chan<- error) {
+	logger.Error("status server error", "component", "http", "kind", "serve", "error", err)
+	select {
+	case errCh <- err:
+	default:
 	}
-	if debugEnabled() && netLogPath != "" {
-		if err := syncFileIfExists(netLogPath); err != nil {
-			logger.Error("sync net log", "component", "startup", "kind", "log_sync", "error", err)
-		}
-	}
-	if errorLogPath != "" {
-		if err := syncFileIfExists(errorLogPath); err != nil {
-			logger.Error("sync error log", "component", "startup", "kind", "log_sync", "error", err)
-		}
-	}
+	stop()
 }
 
 func enforceStratumFreshness(ctx context.Context, jobMgr *JobManager, registry *MinerRegistry, statusServer *StatusServer, start time.Time) {
@@ -1047,7 +1100,7 @@ func enforceStratumFreshness(ctx context.Context, jobMgr *JobManager, registry *
 		h := stratumHealthStatus(jobMgr, now)
 		if !h.Healthy {
 			if unhealthySince.IsZero() {
-				unhealthySince = now
+				unhealthySince = h.unhealthyStart(now)
 			}
 			// Require a long continuous unhealthy window before disconnecting miners.
 			if wasHealthy && now.Sub(unhealthySince) >= stratumStaleJobGrace {

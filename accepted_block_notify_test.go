@@ -307,7 +307,7 @@ func TestHandleBlockShareRespondsBeforeAcceptedBlockNotify(t *testing.T) {
 	go mc.listenJobs()
 	t.Cleanup(func() { jm.Unsubscribe(jobCh) })
 
-	mc.handleBlockShare(1, job, job.JobID, workerName, []byte{0x00, 0x00, 0x00, 0x01}, uint32ToHex8Lower(uint32(job.Template.CurTime)), "00000001", uint32(job.Template.Version), job.ScriptTime, strings.Repeat("0", 64), 1.0, time.Now())
+	mc.handleBlockShare(1, job, job.JobID, workerName, []byte{0x00, 0x00, 0x00, 0x01}, uint32ToHex8Lower(uint32(job.Template.CurTime)), "00000001", uint32(job.Template.Version), job.ScriptTime, nil, nil, strings.Repeat("0", 64), 1.0, time.Now())
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {

@@ -583,9 +583,6 @@ func applyFileOverrides(cfg *Config, fc fileOverrideConfig) {
 	if fc.Version.ShareAllowDegradedVersionBits != nil {
 		cfg.ShareAllowDegradedVersionBits = *fc.Version.ShareAllowDegradedVersionBits
 	}
-	if fc.Version.BIP110Enabled != nil {
-		cfg.BIP110Enabled = *fc.Version.BIP110Enabled
-	}
 }
 
 func applyPolicyConfig(cfg *Config, fc policyFileConfig) {

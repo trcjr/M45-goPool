@@ -19,6 +19,8 @@ func newSubmitReadyMinerConnForModesTest(t *testing.T) (*MinerConn, *Job) {
 	authorizedWorker := "authorized.worker"
 	mc.stats.Worker = authorizedWorker
 	mc.stats.WorkerSHA256 = workerNameHash(authorizedWorker)
+	_, authorizedWallet, authorizedScript := generateTestWorker(t)
+	mc.setWorkerWallet(authorizedWorker, authorizedWallet, authorizedScript)
 
 	job := benchmarkSubmitJobForTest(t)
 	jobID := job.JobID
@@ -85,7 +87,7 @@ func runPrepareSubmission(
 }
 
 func TestPrepareSubmissionTask_WorkerMismatch_AuthorizationToggle(t *testing.T) {
-	t.Run("authorization check rejects mismatched worker", func(t *testing.T) {
+	t.Run("authorization check defers mismatched worker until after PoW", func(t *testing.T) {
 		mc, job := newSubmitReadyMinerConnForModesTest(t)
 		mc.cfg.ShareRequireAuthorizedConnection = true
 		mc.cfg.ShareRequireWorkerMatch = true
@@ -94,11 +96,15 @@ func TestPrepareSubmissionTask_WorkerMismatch_AuthorizationToggle(t *testing.T) 
 		mc.conn = conn
 
 		req := testSubmitRequestForJob(job, "other.worker")
-		if _, ok := mc.prepareSubmissionTask(req, time.Now()); ok {
-			t.Fatalf("expected submit to reject mismatched worker")
+		task, ok := mc.prepareSubmissionTask(req, time.Now())
+		if !ok {
+			t.Fatalf("worker mismatch must remain processable for block safety")
 		}
-		if out := conn.String(); out == "" {
-			t.Fatalf("expected rejection response to be written")
+		if task.policyReject.reason != rejectUnauthorizedWorker {
+			t.Fatalf("policy reason=%v, want unauthorized worker", task.policyReject.reason)
+		}
+		if out := conn.String(); out != "" {
+			t.Fatalf("worker policy was rejected before PoW validation: %q", out)
 		}
 	})
 
@@ -140,22 +146,24 @@ func TestHandleSubmit_DirectProcessingModeSelection(t *testing.T) {
 		submissionWorkers = oldWorkers
 	})
 
-	submissionWorkers = &submissionWorkerPool{tasks: make(chan submissionTask, 1)}
+	submissionWorkers = &submissionWorkerPool{tasks: make(chan preparedSubmissionTask, 1)}
 
 	t.Run("disabled queues to worker pool", func(t *testing.T) {
 		mc, job := newSubmitReadyMinerConnForModesTest(t)
 		mc.cfg.SubmitProcessInline = false
+		conn := &recordConn{}
+		mc.conn = conn
 
 		req := testSubmitRequestForJob(job, mc.currentWorker())
 		mc.handleSubmit(req)
 
 		select {
 		case task := <-submissionWorkers.tasks:
-			if task.mc != mc {
+			if task.task.mc != mc {
 				t.Fatalf("queued task miner mismatch")
 			}
 		default:
-			t.Fatalf("expected task to be queued when direct processing is disabled")
+			t.Fatalf("expected task to be queued when direct processing is disabled; output=%q", conn.String())
 		}
 	})
 
@@ -176,6 +184,24 @@ func TestHandleSubmit_DirectProcessingModeSelection(t *testing.T) {
 		case <-submissionWorkers.tasks:
 			t.Fatalf("did not expect task to be queued when direct processing is enabled")
 		default:
+		}
+	})
+
+	t.Run("closed pool falls back to inline processing", func(t *testing.T) {
+		mc, job := newSubmitReadyMinerConnForModesTest(t)
+		mc.cfg.SubmitProcessInline = false
+
+		conn := &recordConn{}
+		mc.conn = conn
+		submissionWorkers = &submissionWorkerPool{
+			tasks:  make(chan preparedSubmissionTask, 1),
+			closed: true,
+		}
+
+		req := testSubmitRequestForJob(job, mc.currentWorker())
+		mc.handleSubmit(req)
+		if out := conn.String(); out == "" {
+			t.Fatal("expected closed-pool fallback to process the submission inline")
 		}
 	})
 }
@@ -628,6 +654,24 @@ func TestPrepareSubmissionTask_VersionRollingPolicyBoundaries(t *testing.T) {
 		}
 	})
 
+	t.Run("full rolled version remains accepted when its diff is in mask", func(t *testing.T) {
+		mc, req := newVersionReq("20000003")
+		mc.cfg.ShareAllowOutOfMaskVersionBits = false
+		mc.jobMu.Lock()
+		mc.lastJob.Template.Version = int32(0x20000001)
+		mc.jobMu.Unlock()
+		task, ok := mc.prepareSubmissionTask(req, time.Now())
+		if !ok {
+			t.Fatalf("expected compatible full version to remain processable")
+		}
+		if task.policyReject.reason != rejectUnknown {
+			t.Fatalf("unexpected full-version policy reject: %+v", task.policyReject)
+		}
+		if task.useVersion != 0x20000003 {
+			t.Fatalf("full rolled version=%08x want 20000003", task.useVersion)
+		}
+	})
+
 	t.Run("version rolling disabled policy rejects non-zero delta in strict mode", func(t *testing.T) {
 		mc, req := newVersionReq("00000003")
 		mc.versionRoll = false
@@ -658,7 +702,7 @@ func TestPrepareSubmissionTask_VersionRollingPolicyBoundaries(t *testing.T) {
 func TestResolveSubmittedVersionPrefersBIP310WithLegacyAlternate(t *testing.T) {
 	base := uint32(0x20002000)
 	mask := uint32(0x0000e000)
-	got := resolveSubmittedVersion(base, 0x00004000, mask, false)
+	got := resolveSubmittedVersion(base, 0x00004000, mask, true, false, true)
 
 	if got.useVersion != 0x20004000 {
 		t.Fatalf("BIP310 useVersion=%08x want 20004000", got.useVersion)
@@ -671,6 +715,27 @@ func TestResolveSubmittedVersionPrefersBIP310WithLegacyAlternate(t *testing.T) {
 	}
 	if got.alternateUseVersion != 0x20006000 {
 		t.Fatalf("alternateUseVersion=%08x want 20006000", got.alternateUseVersion)
+	}
+}
+
+func TestResolveSubmittedVersionExplicitZeroClearsNegotiatedBits(t *testing.T) {
+	const (
+		base = uint32(0x20100000)
+		mask = uint32(0x1fffe000)
+	)
+
+	omitted := resolveSubmittedVersion(base, 0, mask, true, false, false)
+	if omitted.useVersion != base {
+		t.Fatalf("omitted version = %08x, want base %08x", omitted.useVersion, base)
+	}
+
+	explicitZero := resolveSubmittedVersion(base, 0, mask, true, false, true)
+	want := base &^ mask
+	if explicitZero.useVersion != want {
+		t.Fatalf("explicit zero version = %08x, want %08x", explicitZero.useVersion, want)
+	}
+	if explicitZero.versionDiff != base^want {
+		t.Fatalf("explicit zero diff = %08x, want %08x", explicitZero.versionDiff, base^want)
 	}
 }
 

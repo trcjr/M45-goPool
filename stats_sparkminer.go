@@ -149,25 +149,22 @@ func (s *StatusServer) buildSparkMinerStats(wallet, worker string) *SparkMinerSt
 
 	// 8. Per-worker stats (if wallet/worker provided)
 	if wallet != "" {
-		// Look up worker in the registry
-		if s.registry != nil {
-			entry, ok := view.WorkerLookup[wallet]
-			if ok {
-				// Worker hashrate
-				if entry.RollingHashrate > 0 {
-					hashrateStr := formatHashrateValue(entry.RollingHashrate)
-					stats.WorkerHashrate = &hashrateStr
-				}
+		entry, ok := view.WorkerLookup[wallet]
+		if ok {
+			// Worker hashrate
+			if entry.RollingHashrate > 0 {
+				hashrateStr := formatHashrateValue(entry.RollingHashrate)
+				stats.WorkerHashrate = &hashrateStr
+			}
 
-				// Best difficulty
-				if entry.Difficulty > 0 {
-					diffStr := formatDiffValue(entry.Difficulty)
-					stats.AddressBestDiff = &diffStr
-				}
+			// Best difficulty
+			if entry.Difficulty > 0 {
+				diffStr := formatDiffValue(entry.Difficulty)
+				stats.AddressBestDiff = &diffStr
+			}
 
-				if entry.WindowDifficulty > 0 {
-					windowDifficulty = entry.WindowDifficulty
-				}
+			if entry.WindowDifficulty > 0 {
+				windowDifficulty = entry.WindowDifficulty
 			}
 		}
 	}
@@ -222,7 +219,10 @@ func (s *StatusServer) buildSparkMinerStats(wallet, worker string) *SparkMinerSt
 			secondsPerShare := 1.0 / view.SharesPerSecond
 			sharesPerBlock := secondsPerBlock / secondsPerShare
 			blocksUntilAdjustment := int64(2016.0 / sharesPerBlock)
-			if blocksUntilAdjustment > 0 && blocksUntilAdjustment < 2016 {
+			if blocksUntilAdjustment <= 0 {
+				blocksUntilAdjustment = 1
+			}
+			if blocksUntilAdjustment < 2016 {
 				stats.DifficultyRetargetBlocks = &blocksUntilAdjustment
 			}
 		}

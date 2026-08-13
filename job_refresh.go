@@ -3,10 +3,15 @@ package main
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 )
 
-const acceptedBlockRefreshPollInterval = 100 * time.Millisecond
+const (
+	acceptedBlockRefreshPollInterval = 100 * time.Millisecond
+	jobTemplateRefreshTimeout        = 10 * time.Second
+	jobBlockHistoryRefreshTimeout    = 3 * time.Second
+)
 
 func (jm *JobManager) refreshJobCtx(ctx context.Context) error {
 	return jm.refreshJobCtxMinInterval(ctx, 100*time.Millisecond)
@@ -17,6 +22,9 @@ func (jm *JobManager) refreshJobCtxForce(ctx context.Context) error {
 }
 
 func (jm *JobManager) refreshJobCtxMinInterval(ctx context.Context, minInterval time.Duration) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	jm.refreshMu.Lock()
 	defer jm.refreshMu.Unlock()
 	if minInterval > 0 && time.Since(jm.lastRefreshAttempt) < minInterval {
@@ -28,12 +36,22 @@ func (jm *JobManager) refreshJobCtxMinInterval(ctx context.Context, minInterval 
 		"rules":        []string{"segwit"},
 		"capabilities": []string{"coinbasetxn", "workid", "coinbase/append"},
 	}
-	tpl, err := jm.fetchTemplateCtx(ctx, params, false)
+	refreshTimeout := jm.refreshRPCTimeout
+	if refreshTimeout <= 0 {
+		refreshTimeout = jobTemplateRefreshTimeout
+	}
+	refreshCtx, cancel := context.WithTimeout(ctx, refreshTimeout)
+	defer cancel()
+
+	tpl, err := jm.fetchTemplateCtx(refreshCtx, params, false)
 	if err != nil {
 		jm.recordJobError(err)
 		return err
 	}
-	return jm.refreshFromTemplate(ctx, tpl)
+	// Keep the verification RPC and template application inside the same
+	// bounded attempt as GBT. refreshFromTemplate also applies its own bound for
+	// long-poll callers, whose parent context intentionally has no deadline.
+	return jm.refreshFromTemplate(refreshCtx, tpl)
 }
 
 func (jm *JobManager) fetchTemplateCtx(ctx context.Context, params map[string]any, useLongPoll bool) (GetBlockTemplateResult, error) {
@@ -52,23 +70,51 @@ func (jm *JobManager) refreshFromTemplate(ctx context.Context, tpl GetBlockTempl
 }
 
 func (jm *JobManager) refreshFromTemplateWithReason(ctx context.Context, tpl GetBlockTemplateResult, reason string, syncBroadcast bool) error {
-	jm.applyMu.Lock()
-	defer jm.applyMu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timeout := jm.refreshRPCTimeout
+	if timeout <= 0 {
+		timeout = jobTemplateRefreshTimeout
+	}
+	refreshCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if err := lockMutexContext(refreshCtx, &jm.applyMu); err != nil {
+		jm.recordJobError(err)
+		return err
+	}
 
-	needsNewJob, clean := jm.templateChanged(tpl)
+	jm.mu.RLock()
+	previousJob := jm.curJob
+	jm.mu.RUnlock()
+	needsNewJob, clean := jm.templateChangedLocked(tpl)
 
 	// If the template hasn't meaningfully changed, skip building and broadcasting a new job.
 	// This avoids unnecessary job churn and duplicate JobIDs for the same work.
 	if !needsNewJob {
+		// An unchanged GBT payload is not proof that its parent is still the
+		// active chain tip. In particular, a ZMQ-triggered refresh can race Core's
+		// template update after a block or reorg. Verify before treating this as a
+		// healthy heartbeat or advancing the opaque long-poll cursor.
+		if err := jm.ensureTemplateFresh(refreshCtx, tpl); err != nil {
+			jm.recordJobError(err)
+			jm.applyMu.Unlock()
+			return err
+		}
+		jm.mu.Lock()
+		jm.longPollID = tpl.LongPollID
+		jm.mu.Unlock()
 		// Heartbeat: the node responded successfully, even if the template was unchanged.
 		jm.recordJobSuccess(nil)
 		jm.updateBlockTipFromTemplate(tpl)
+		jm.applyMu.Unlock()
 		return nil
 	}
 
-	job, err := jm.buildJob(ctx, tpl)
+	job, err := jm.buildJobLocked(refreshCtx, tpl)
 	if err != nil {
 		jm.recordJobError(err)
+		jm.applyMu.Unlock()
 		return err
 	}
 	job.Clean = clean
@@ -82,20 +128,31 @@ func (jm *JobManager) refreshFromTemplateWithReason(ctx context.Context, tpl Get
 
 	jm.mu.Lock()
 	jm.curJob = job
+	jm.longPollID = tpl.LongPollID
 	jm.mu.Unlock()
 
 	prevHeight := jm.blockTipHeight()
-
-	jm.recordJobSuccess(job)
 	jm.updateBlockTipFromTemplate(tpl)
-	if tpl.Height > prevHeight {
-		jm.refreshBlockHistoryFromRPC(ctx)
-	}
+	tipChanged := previousJob == nil ||
+		previousJob.Template.Previous != tpl.Previous ||
+		previousJob.Template.Height != tpl.Height
 	logger.Info("new job", "height", tpl.Height, "job_id", job.JobID, "bits", tpl.Bits, "txs", len(tpl.Transactions))
 	if syncBroadcast {
 		jm.broadcastJobSync(job)
 	} else {
 		jm.broadcastJob(job)
+	}
+	// Publish work before declaring the feed recovered. The queue is
+	// non-blocking, so no auxiliary status RPC can delay miners receiving the
+	// new parent/template.
+	jm.recordJobSuccess(job)
+	jm.applyMu.Unlock()
+
+	// Header history feeds only status/timing data. Run it after the complete
+	// mining update is published and after applyMu is released. The worker is
+	// independently bounded and coalesces churn to the newest job.
+	if tipChanged || (tpl.Height > 0 && tpl.Height-1 > prevHeight) {
+		jm.scheduleBlockHistoryRefresh(job)
 	}
 	return nil
 }
@@ -139,5 +196,35 @@ func (jm *JobManager) refreshAfterAcceptedBlock(ctx context.Context, acceptedHei
 		}
 
 		return jm.refreshFromTemplateWithReason(ctx, tpl, "accepted_block", true)
+	}
+}
+
+func lockMutexContext(ctx context.Context, mu *sync.Mutex) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if mu.TryLock() {
+		return nil
+	}
+
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if !mu.TryLock() {
+				continue
+			}
+			if err := ctx.Err(); err != nil {
+				mu.Unlock()
+				return err
+			}
+			return nil
+		}
 	}
 }

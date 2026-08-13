@@ -1,8 +1,11 @@
 # goPool Operations Documentation
 
-> **Quick start reminder:** the [main README](../README.md) gives a concise walk-through; this document expands each section into the operational context needed to run goPool day-to-day.
+For initial setup, start with the [main README](../README.md). This guide covers
+day-to-day operation and configuration.
 
-goPool ships as a self-contained pool daemon that connects directly to Bitcoin Core (JSON-RPC + ZMQ), hosts a Stratum v1 endpoint, and exposes a status UI with JSON APIs. This documentation covers the operational steps teams repeat in production; refer to sibling documents (especially `documentation/TESTING.md`) for testing recipes.
+goPool connects directly to Bitcoin Core over JSON-RPC and ZMQ, hosts a Stratum
+v1 endpoint, and exposes a status UI with JSON APIs. See the
+[testing guide](TESTING.md) for test and profiling workflows.
 
 Operational Stratum notes:
 
@@ -10,7 +13,6 @@ Operational Stratum notes:
 - When the node/job feed is stale, the main status page (`/`) displays a dedicated "node unavailable" page instead of the normal overview.
 - A background heartbeat (`stratumHeartbeatInterval`) performs periodic non-longpoll template refreshes so "quiet mempool / no template churn" does not look like a dead node.
 - When updates are degraded but basic node RPC calls still work, the node-unavailable page will also show common sync/indexing indicators (IBD flag and blocks/headers) to help diagnose "node indexing" situations.
-
 
 ## Containerization (Docker/Compose)
 
@@ -37,7 +39,8 @@ docker run --rm -it \
 
 ### Using Docker Compose
 
-+Edit `.env` or `env.example` to set environment variables (ports, build args, runtime flags). Then:
+Copy `env.example` to `.env`, then adjust ports, build arguments, and runtime
+flags as needed:
 
 ```bash
 docker compose up -d --build
@@ -47,24 +50,27 @@ This will build and start the container, mapping ports and mounting `./data` for
 
 ### Build arguments and environment variables
 
-- `BUILD_TIME` and `BUILD_VERSION` are passed at build time (set automatically by the Makefile and CI).
+- `BUILD_TIME` and `BUILD_VERSION` are passed to the Docker build from `.env`.
 - Runtime environment variables (see `env.example`) control ports, network mode, and extra flags.
 
 ### Persistent data
 
 The `data` directory is mounted into the container at `/app/data` to persist configuration, logs, and state. Always back up this directory.
 
----
+## Native build
 
 Requirements:
-* **Go 1.26.0+** — install from https://go.dev/dl/ for matching ABI guarantees.
-* **ZeroMQ headers** (`libzmq3-dev`, `zeromq`, etc.) to satisfy `github.com/pebbe/zmq4`. On Debian/Ubuntu run `sudo apt install -y libzmq3-dev`; other distros follow their package manager.
+
+- **Go 1.26.5+** — install from [go.dev](https://go.dev/dl/).
+- **ZeroMQ headers** (`libzmq3-dev`, `zeromq`, etc.) for
+  `github.com/pebbe/zmq4`. On Debian or Ubuntu, run
+  `sudo apt install -y libzmq3-dev`.
 
 Clone and build:
 
 ```bash
-git clone https://github.com/Distortions81/M45-Core-goPool.git
-cd M45-Core-goPool
+git clone https://github.com/Distortions81/M45-goPool.git
+cd M45-goPool
 go build -o goPool
 ```
 
@@ -72,15 +78,16 @@ Use `GOOS`/`GOARCH` for cross-compilation and avoid `go install` unless populati
 
 ### Build metadata
 
-Release builds embed two fields via `-ldflags`:
+Builds can embed two fields via `-ldflags`:
 
 - `main.buildTime`: the UTC timestamp recorded when the binary was compiled. The status UI exposes it as `build_time`.
 - `main.buildVersion`: the version label (e.g., `v1.2.3`) and shows up under `build_version`.
 
-GitHub Actions sets both automatically per run. If you build manually and want consistent metadata, pass the same flags yourself:
+The helper script `scripts/build-pool.sh` sets both fields automatically. To
+set them directly, pass the same flags to `go build`:
 
-```
-go build -ldflags="-X main.buildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ) -X main.buildVersion=vX.Y.Z" ./...
+```bash
+go build -ldflags="-X main.buildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ) -X main.buildVersion=vX.Y.Z" -o goPool .
 ```
 
 Both values appear on the status page and JSON endpoints so you can verify the exact build at runtime.
@@ -146,7 +153,7 @@ The required `data/config/config.toml` is the primary interface for pool behavio
 - `[mining]`: Pool fee, donation settings, and `pooltag_prefix`.
 - `[logging]`: `debug` enables verbose runtime logging, and `net_debug` enables raw network tracing (`net-debug.log`) when debug logging is active.
 
-Set numeric values explicitly (do not rely on automation), and trim whitespace (goPool trims internally but a clean config is easier to audit). After editing, restart goPool or send `SIGUSR2` (see below).
+Set numeric values explicitly (do not rely on automation), and trim whitespace (goPool trims internally but a clean config is easier to audit). Restart goPool after changing mining, payout, listener, node, storage, service, or connection-policy settings. `SIGUSR2` is only a partial runtime reload and is not a substitute for a restart; see the warning under [Runtime operations](#runtime-operations).
 
 ### Split Override Files
 
@@ -162,8 +169,8 @@ Optional split override files can layer advanced settings without touching the m
 - `[hashrate]`: `hashrate_ema_tau_seconds`, `share_ntime_max_forward_seconds`.
 - `[peer_cleaning]`: Enable/disable peer cleanup and tune thresholds.
 - `[bans]`: Ban thresholds/durations, `banned_miner_types` (disconnect miners by client ID on subscribe), and `clean_expired_on_startup` (defaults to `true`). Prefer `data/config/miner_blacklist.json` for client ID blacklist management; it overrides `banned_miner_types` when present. Set `clean_expired_on_startup = false` if you want to keep expired bans for inspection.
-- `[version]` in `policy.toml`: `min_version_bits` (advertised/negotiated bit count, not a per-share changed-bit requirement), `share_allow_out_of_mask_version_bits` (allows submits outside negotiated mask, useful for BIP-110 bit 4 signaling), `share_allow_degraded_version_bits` (retained compatibility flag), and `bip110_enabled` (sets bit 4 on newly generated templates).
-- `version_bits.toml`: explicit `[[bits]]` overrides for block header version bits (`bit=<0..31>`, `enabled=true|false`). This file is read-only from goPool's perspective and is never rewritten. Overrides are applied after `bip110_enabled`, so `version_bits.toml` has final authority per bit.
+- `[version]` in `policy.toml`: `min_version_bits` (advertised/negotiated bit count, not a per-share changed-bit requirement), `share_allow_out_of_mask_version_bits` (allows legacy submits outside the negotiated mask), and `share_allow_degraded_version_bits` (retained compatibility flag).
+- `version_bits.toml`: explicit `[[bits]]` overrides for block header version bits (`bit=<0..31>`, `enabled=true|false`). This file is read-only from goPool's perspective and is never rewritten; listed overrides have final authority per bit.
 
 Keep these files absent to use built-in defaults. The first run creates examples under `data/config/examples/`.
 
@@ -236,7 +243,9 @@ The status UI uses two listeners:
 
 Set `status_tls_listen = ""` to disable HTTPS and keep only the HTTP listener. Set `status_listen = ""` to disable HTTP entirely and rely solely on TLS. The CLI no longer provides an `-http-only` toggle.
 
-goPool also auto-creates `/stats/` and `/api/*` handlers plus optional TLS/cert reloading. Run `systemctl kill -s SIGUSR1 <service>` to reload the templates (the previous template set is kept when parsing fails) and `SIGUSR2` to reload the configuration files without stopping the daemon.
+For Let's Encrypt HTTP-01, goPool creates and serves `data/certbot-webroot/.well-known/acme-challenge/` on the status HTTP listener before HTTP-to-HTTPS redirects. Use `scripts/certbot-gopool.sh --webroot` with the default webroot, or point certbot at the same directory manually. The bundled UI files under `data/www` are embedded into the goPool binary and are separate from this runtime certbot webroot.
+
+goPool also auto-creates `/stats/` and `/api/*` handlers plus optional TLS/cert reloading. Run `systemctl kill -s SIGUSR1 <service>` to reload the templates (the previous template set is kept when parsing fails). `SIGUSR2` re-reads the configuration files without stopping the daemon, but only publishes part of the new configuration at runtime; see the warning under [Runtime operations](#runtime-operations).
 
 ## Admin Control Panel
 
@@ -334,9 +343,11 @@ Each override value logs when set, so goPool operators can audit what changed vi
 ## Runtime operations
 
 - **SIGUSR1** re-parses the embedded HTML templates and refreshes the embedded static cache. Errors are logged but the previous template set remains active so the site keeps serving—check `pool.log` if pages look odd after a reload.
-- **SIGUSR2** reloads `config.toml`, `secrets.toml`, `services.toml`, `policy.toml`, `tuning.toml`, and `version_bits.toml`, reapplies overrides, and updates the status server with the new config.
+- **SIGUSR2** re-reads `config.toml`, `secrets.toml`, `services.toml`, `policy.toml`, `tuning.toml`, and `version_bits.toml`, reapplies overrides, updates the status server's configuration snapshot, changes the runtime log level, and toggles network-debug logging. Future miner connections consume parts of that new snapshot.
 - **Shutdown** occurs on `SIGINT`/`SIGTERM`. goPool stops the status servers, Stratum listener, and pending replayers gracefully.
 - **TLS cert reloading** uses `certReloader` to monitor `data/tls_cert.pem`/`tls_key.pem` hourly. Certificate renewals (e.g., via certbot) are picked up without restarts.
+
+> **Warning — `SIGUSR2` is a partial reload.** It does not rebuild the job manager or replace its payout and job-building policy, reconfigure listeners or node/ZMQ clients, update the reconnect limiter, rebuild long-lived services, or change already-connected miner sessions. After `SIGUSR2`, the status UI and future connections can therefore reflect new settings while active sessions and generated jobs still use old settings. This mixed state is especially unsafe to rely on for payout-address, fee, donation, coinbase, extranonce, version-bit, or other mining-policy changes. Restart goPool to apply those changes coherently. Use `SIGUSR2` only when that partial behavior is understood and acceptable.
 
 ## Monitoring APIs
 
