@@ -12,11 +12,12 @@ from pathlib import Path
 from typing import Any
 
 
-POOLS = ["gopool", "pogolo", "ckpool"]
-MINERS = [100, 1000, 10000]
+DEFAULT_POOLS = ["gopool", "pogolo", "ckpool", "warppool", "public-pool"]
+DEFAULT_MINERS = [100, 1000, 10000]
 GOOD = (24, 143, 74)
 MID = (242, 215, 121)
 BAD = (217, 47, 39)
+FAILED = "#7f1d1d"
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,7 +102,11 @@ def text_class(hex_color: str) -> str:
 
 
 def panel_records(
-    records: list[dict[str, Any]], kind: str, mode: str | None = None
+    records: list[dict[str, Any]],
+    pools: list[str],
+    miners: list[int],
+    kind: str,
+    mode: str | None = None,
 ) -> list[dict[str, Any]]:
     by_key = {
         (row["pool"], int(row["miners"])): row
@@ -110,11 +115,11 @@ def panel_records(
     }
     ordered: list[dict[str, Any]] = []
     missing: list[str] = []
-    for pool in POOLS:
-        for miners in MINERS:
-            row = by_key.get((pool, miners))
+    for pool in pools:
+        for miner_count in miners:
+            row = by_key.get((pool, miner_count))
             if row is None:
-                missing.append(f"{kind}/{mode or '-'} {pool} {miners}")
+                missing.append(f"{kind}/{mode or '-'} {pool} {miner_count}")
             else:
                 ordered.append(row)
     if missing:
@@ -129,32 +134,53 @@ def svg_text(x: int, y: int, cls: str, text: str) -> str:
 def render_panel(
     title: str,
     rows: list[dict[str, Any]],
+    pools: list[str],
+    miners: list[int],
     metrics: list[tuple[str, str, bool]],
     y_offset: int,
+    log_scale: bool = False,
 ) -> list[str]:
     out: list[str] = [f'  <g transform="translate(0 {y_offset})">']
     out.append(svg_text(34, 0, "panel", title))
-    out.append(svg_text(34, 52, "head", "pool / miners"))
+    out.append(svg_text(96, 52, "head", "pool / miners"))
     for i, (label, _, _) in enumerate(metrics):
         out.append(svg_text(238 + i * 118, 52, "head", label))
 
     scales: dict[str, tuple[float, float]] = {}
     for _, key, _ in metrics:
-        values = [metric_value(row, key) for row in rows]
+        values = [
+            math.log10(max(metric_value(row, key), 1e-9)) if log_scale else metric_value(row, key)
+            for row in rows
+            if row.get("status") != "failed"
+        ]
+        if not values:
+            values = [0.0]
         scales[key] = (min(values), max(values))
 
     y = 66
-    for pool_index, pool in enumerate(POOLS):
+    for pool_index, pool in enumerate(pools):
         if pool_index:
             y += 8
-        for miners in MINERS:
-            row = next(r for r in rows if r["pool"] == pool and int(r["miners"]) == miners)
-            out.append(svg_text(34, y + 16, "row", f"{pool} {miners}"))
+        for miner_count in miners:
+            row = next(
+                r
+                for r in rows
+                if r["pool"] == pool and int(r["miners"]) == miner_count
+            )
+            out.append(svg_text(34, y + 16, "row", f"{pool} {miner_count}"))
+            if row.get("status") == "failed":
+                out.append(f'    <rect x="179" y="{y}" width="590" height="32" fill="{FAILED}"/>')
+                reason = str(row.get("reason", "benchmark failed"))
+                label = "N/A*" if "connection cap is 4096" in reason else f"FAIL — {reason}"
+                out.append(svg_text(474, y + 16, "cell dark", label))
+                y += 32
+                continue
             for i, (_, key, higher_is_better) in enumerate(metrics):
                 x = 179 + i * 118
                 value = metric_value(row, key)
                 lo, hi = scales[key]
-                color = color_for(value, lo, hi, higher_is_better)
+                color_value = math.log10(max(value, 1e-9)) if log_scale else value
+                color = color_for(color_value, lo, hi, higher_is_better)
                 out.append(f'    <rect x="{x}" y="{y}" width="118" height="32" fill="{color}"/>')
                 out.append(
                     svg_text(
@@ -173,17 +199,29 @@ def main() -> None:
     args = parse_args()
     metadata, records = read_records(Path(args.input))
     run_date = args.title_date or metadata.get("date") or dt.datetime.now(dt.UTC).date().isoformat()
+    result_profile = str(metadata.get("result_profile", "legacy unlabeled profile"))
     if run_date and len(run_date) == 10:
         run_date = dt.date.fromisoformat(run_date).strftime("%B %-d, %Y")
 
-    submit = panel_records(records, "submit")
-    notify_zmq = panel_records(records, "notify", "zmq")
-    notify_nozmq = panel_records(records, "notify", "no-zmq")
+    pools = [str(pool) for pool in metadata.get("pools", DEFAULT_POOLS)]
+    miners = [int(miner_count) for miner_count in metadata.get("miners", DEFAULT_MINERS)]
+    submit = panel_records(records, pools, miners, "submit")
+    notify_zmq = panel_records(records, pools, miners, "notify", "zmq")
+    notify_nozmq = panel_records(records, pools, miners, "notify", "no-zmq")
+
+    panel_height = 58 + (32 * len(miners) + 8) * len(pools)
+    panel_offsets = [
+        96,
+        96 + panel_height + 46,
+        96 + panel_height * 2 + 76,
+    ]
+    footnote_y = panel_offsets[2] + panel_height + 34
+    svg_height = footnote_y + 40
 
     lines = [
-        '<svg xmlns="http://www.w3.org/2000/svg" width="820" height="1320" viewBox="0 0 820 1320" role="img" aria-labelledby="title desc">',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="820" height="{svg_height}" viewBox="0 0 820 {svg_height}" role="img" aria-labelledby="title desc">',
         '  <title id="title">goPool benchmark heat map</title>',
-        f'  <desc id="desc">Heat map of all numeric values in the mining.submit and mining.notify benchmark tables from the {html.escape(str(run_date))} rerun. Each metric column is colored independently; green is better and red is worse.</desc>',
+        f'  <desc id="desc">Heat map of mining.submit and mining.notify benchmark results from the {html.escape(str(run_date))} rerun using the {html.escape(result_profile)}. Each numeric metric column is colored independently; failed cells are labeled explicitly.</desc>',
         "  <style>",
         '    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }',
         "    .title { font-size: 26px; font-weight: 700; }",
@@ -195,9 +233,9 @@ def main() -> None:
         "    .light { fill: #111827; }",
         "    .dark { fill: #ffffff; }",
         "  </style>",
-        '  <rect width="820" height="1320" fill="#ffffff"/>',
+        f'  <rect width="820" height="{svg_height}" fill="#ffffff"/>',
         '  <text x="34" y="42" class="title">Benchmark heat map</text>',
-        f'  <text x="34" y="66" class="subtitle">Rerun {html.escape(str(run_date))}. Every numeric table value is a tile; green is better, red is worse.</text>',
+        f'  <text x="34" y="66" class="subtitle">{html.escape(result_profile.title())} · rerun {html.escape(str(run_date))}. Green is better; red is worse.</text>',
         '  <g transform="translate(560 30)">',
         '    <rect x="0" y="0" width="44" height="16" fill="#188f4a"/>',
         '    <rect x="44" y="0" width="44" height="16" fill="#88b462"/>',
@@ -211,6 +249,8 @@ def main() -> None:
     lines += render_panel(
         "mining.submit",
         submit,
+        pools,
+        miners,
         [
             ("valid/s", "validated_per_sec", True),
             ("p50", "p50", False),
@@ -218,11 +258,14 @@ def main() -> None:
             ("p99", "p99", False),
             ("max", "max", False),
         ],
-        96,
+        panel_offsets[0],
+        log_scale=True,
     )
     lines += render_panel(
         "mining.notify, ZMQ/default",
         notify_zmq,
+        pools,
+        miners,
         [
             ("avg", "avg", False),
             ("p50", "p50", False),
@@ -230,11 +273,14 @@ def main() -> None:
             ("p99", "p99", False),
             ("max", "max", False),
         ],
-        520,
+        panel_offsets[1],
+        log_scale=True,
     )
     lines += render_panel(
         "mining.notify, no pool-side ZMQ",
         notify_nozmq,
+        pools,
+        miners,
         [
             ("avg", "avg", False),
             ("p50", "p50", False),
@@ -242,8 +288,11 @@ def main() -> None:
             ("p99", "p99", False),
             ("max", "max", False),
         ],
-        928,
+        panel_offsets[2],
+        log_scale=True,
     )
+    lines.append(svg_text(34, footnote_y, "subtitle", "* WarpPool's stock Enterprise profile has a 4,096-connection hard cap."))
+    lines.append(svg_text(34, footnote_y + 22, "subtitle", "Colors use a logarithmic scale so outliers do not flatten the panels."))
     lines.append("</svg>")
 
     output = Path(args.output)
